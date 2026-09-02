@@ -5,10 +5,11 @@ import WebSocket from 'ws';
 const API_URL = (process.env.PERPL_API_URL ?? 'https://app.perpl.xyz/api').replace(/\/$/, '');
 const WS_URL = (process.env.PERPL_WS_URL ?? 'wss://app.perpl.xyz').replace(/\/$/, '');
 const CHAIN_ID = Number(process.env.PERPL_CHAIN_ID ?? 143);
+const configuredAccountId = process.env.PERPL_ACCOUNT_ID ? Number(process.env.PERPL_ACCOUNT_ID) : null;
 
 type Json = Record<string, unknown>;
-type Account = { mt?: number; in?: number; id?: number; fr?: boolean; fw?: boolean; lfr?: number; b?: string; lb?: string };
-type State = { account: Account | null; orders: Json[]; positions: Json[]; headBlock: number | null; sequence: number | null; updatedAt: number };
+type Account = { mt?: number; in?: number; id?: number; fr?: boolean; fw?: boolean; ft?: number; lfr?: number; b?: string; lb?: string; h?: Json[] };
+type State = { walletAddress: string | null; accounts: Account[]; account: Account | null; orders: Json[]; positions: Json[]; headBlock: number | null; sequence: number | null; updatedAt: number };
 type OrderInput = { mkt: number; t: number; s: number; lv: number; fl: number; p?: number; a?: string; ms?: number; tif?: number; tp?: number; tpc?: number; tr?: number; lp?: number; bf?: number };
 
 function requireConfig() {
@@ -34,12 +35,13 @@ function object(value: unknown): Json | null {
 }
 function array(value: unknown): Json[] { return Array.isArray(value) ? value.filter((item): item is Json => !!object(item)) : []; }
 function numeric(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
+function decimalString(value: unknown): string | null { return typeof value === 'string' ? value : null; }
 
 export class PerplClient {
   private ws?: WebSocket;
   private requestId = 0;
   private sequenceId = 0;
-  private state: State = { account: null, orders: [], positions: [], headBlock: null, sequence: null, updatedAt: 0 };
+  private state: State = { walletAddress: null, accounts: [], account: null, orders: [], positions: [], headBlock: null, sequence: null, updatedAt: 0 };
   private buffer: Json[] = [];
   private listeners = new Set<(message: Json) => void>();
   private connectPromise: Promise<void> | null = null;
@@ -103,12 +105,47 @@ export class PerplClient {
 
   private ready() { return !!this.state.account && this.state.headBlock !== null && this.state.sequence !== null; }
 
+  private availableBalance(account: Account | null): string | null {
+    const balance = decimalString(account?.b);
+    const locked = decimalString(account?.lb);
+    if (balance === null) return null;
+    if (locked === null) return balance;
+    try { return (Number(balance) - Number(locked)).toString(); } catch { return balance; }
+  }
+
+  private selectAccount(accounts: Account[]): Account | null {
+    if (!accounts.length) return null;
+    if (configuredAccountId !== null && Number.isFinite(configuredAccountId)) {
+      return accounts.find((item) => Number(item.id) === configuredAccountId) ?? null;
+    }
+    return accounts.length === 1 ? accounts[0] : accounts.find((item) => decimalString(item.b) !== '0') ?? accounts[0];
+  }
+
   private publicState() {
+    const account = this.state.account;
+    const accountSummaries = this.state.accounts.map((item) => ({
+      instance_id: item.in ?? null,
+      account_id: item.id ?? null,
+      balance: item.b ?? null,
+      locked_balance: item.lb ?? null,
+      available_balance: this.availableBalance(item),
+      frozen: item.fr ?? null,
+      forwarding: item.fw ?? null,
+      fee_tier: item.ft ?? null,
+      last_forwarded_request_id: item.lfr ?? null,
+    }));
     return {
       status: this.ready() ? 'ok' : 'connecting',
-      trading_available: this.ready() && this.state.account?.fr !== true && this.state.account?.fw !== false,
+      trading_available: this.ready() && account?.fr !== true && account?.fw !== false,
       connector: 'perpl-direct',
-      account: this.state.account,
+      wallet_address: this.state.walletAddress,
+      selected_account_id: account?.id ?? null,
+      configured_account_id: configuredAccountId,
+      account: account,
+      accounts: accountSummaries,
+      balance: account?.b ?? null,
+      locked_balance: account?.lb ?? null,
+      available_balance: this.availableBalance(account),
       orders: this.state.orders,
       positions: this.state.positions,
       head_block: this.state.headBlock,
@@ -159,16 +196,22 @@ export class PerplClient {
   private consume(message: Json) {
     this.state.updatedAt = Date.now();
     if (Number(message.mt) === 19) {
-      const account = object(array(message.as)[0]);
-      if (account) {
-        this.state.account = account as Account;
-        const lfr = numeric(account.lfr);
+      this.state.walletAddress = typeof message.addr === 'string' ? message.addr : null;
+      const accounts = array(message.as).map((item) => item as Account);
+      this.state.accounts = accounts;
+      this.state.account = this.selectAccount(accounts);
+      if (this.state.account) {
+        const lfr = numeric(this.state.account.lfr);
         if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
       }
       this.state.sequence = numeric(message.sn);
     } else if (Number(message.mt) === 20 || Number(message.mt) === 21) {
-      const account = object(message.d);
-      if (account) this.state.account = { ...this.state.account, ...account } as Account;
+      const account = object(message.d) as Account | null;
+      if (account) {
+        const next = this.state.accounts.map((item) => Number(item.id) === Number(account.id) ? { ...item, ...account } : item);
+        this.state.accounts = next.some((item) => Number(item.id) === Number(account.id)) ? next : [...next, account];
+        this.state.account = this.selectAccount(this.state.accounts);
+      }
       const lfr = numeric(account?.lfr);
       if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
     } else if (Number(message.mt) === 23) this.state.orders = array(message.d);
@@ -179,7 +222,7 @@ export class PerplClient {
       const sequence = numeric(message.sn);
       const head = numeric(message.h);
       if (sequence !== null && this.state.sequence !== null && sequence !== this.state.sequence + 1) {
-        this.state.account = null; this.state.orders = []; this.state.positions = []; this.state.headBlock = null; this.state.sequence = null;
+        this.state.walletAddress = null; this.state.accounts = []; this.state.account = null; this.state.orders = []; this.state.positions = []; this.state.headBlock = null; this.state.sequence = null;
       } else if (sequence !== null) this.state.sequence = sequence;
       if (head !== null) this.state.headBlock = head;
     }
