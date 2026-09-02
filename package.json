@@ -1,6 +1,6 @@
 {
   "name": "qwen-autonomous-agent",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,13 +8,17 @@
     "start": "tsx src/index.ts"
   },
   "dependencies": {
+    "@noble/ed25519": "^3.0.0",
     "dotenv": "^17.2.1",
     "openai": "^5.19.1",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.5",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2",
-    "@types/pg": "^8.15.5"
+    "typescript": "^5.9.2"
   }
 }
