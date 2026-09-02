@@ -56,6 +56,30 @@ export class PerplClient {
     return body;
   }
 
+  async getMarketCandles(marketId: number, resolutionSeconds: number, fromMs: number, toMs: number): Promise<unknown> {
+    if (!Number.isInteger(marketId) || marketId <= 0) throw new Error('Invalid Perpl market id');
+    if (!Number.isInteger(resolutionSeconds) || resolutionSeconds <= 0) throw new Error('Invalid Perpl candle resolution');
+    if (!Number.isInteger(fromMs) || !Number.isInteger(toMs) || fromMs < 0 || toMs <= fromMs) throw new Error('Invalid Perpl candle time range');
+    if (toMs - fromMs > 1024 * resolutionSeconds * 1000) throw new Error('Perpl candle request exceeds the 1024-candle limit');
+    const response = await fetch(`${API_URL}/v1/market-data/${marketId}/candles/${resolutionSeconds}/${fromMs}-${toMs}`);
+    const text = await response.text();
+    let body: unknown;
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+    if (!response.ok) throw new Error(`Perpl candle data ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    return body;
+  }
+
+  async getFunding(marketId: number, fromMs: number, toMs: number): Promise<unknown> {
+    if (!Number.isInteger(marketId) || marketId <= 0) throw new Error('Invalid Perpl market id');
+    if (!Number.isInteger(fromMs) || !Number.isInteger(toMs) || fromMs < 0 || toMs <= fromMs) throw new Error('Invalid Perpl funding time range');
+    const response = await fetch(`${API_URL}/v1/market-data/${marketId}/funding/${fromMs}-${toMs}`);
+    const text = await response.text();
+    let body: unknown;
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+    if (!response.ok) throw new Error(`Perpl funding ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    return body;
+  }
+
   async getState(): Promise<unknown> {
     await this.connect(true);
     const startedAt = Date.now();
