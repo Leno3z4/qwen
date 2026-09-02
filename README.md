@@ -10,7 +10,9 @@ The app also serves a browser dashboard where you can edit the strategy, enable/
 
 ## Setup
 
-Create `.env` from `.env.example` and set `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL`, `AGENTHUB_URL`, `AGENT_CREDENTIAL`, and `DASHBOARD_PASSWORD`.
+Create `.env` from `.env.example` and set `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL`, `AGENTHUB_URL`, `AGENT_IDENTITY_ACCESS_KEY`, `AGENT_NAME`, and `DASHBOARD_PASSWORD`.
+
+`AGENT_IDENTITY_ACCESS_KEY` is preferred: Qwen uses it to call AgentHub2's connect endpoint and automatically refresh the 24-hour trading credential. `AGENT_CREDENTIAL` can still be supplied directly when you already have a current agent credential.
 
 Install and run:
 
@@ -23,9 +25,9 @@ Open `http://localhost:3000`.
 
 ## AgentHub2 connection
 
-AgentHub2 exposes `POST /api/agent/connect`. It accepts an identity access key/connection token and returns a short-lived `connection_token` for the created agent. Its current credential lifetime is capped at 24 hours, so a true always-on deployment needs credential renewal or periodic re-connection.
+AgentHub2 exposes `POST /api/agent/connect`. It accepts an identity access key/connection token and returns a short-lived `connection_token` for the created agent. The trading credential is capped at 24 hours, so the Qwen app renews it every 12 hours when `AGENT_IDENTITY_ACCESS_KEY` is configured.
 
-Put the resulting connection token in `AGENT_CREDENTIAL`. The current AgentHub2 routes are the source of truth for permissions; the execution layer handles authentication and Perpl order submission.
+The current AgentHub2 routes are the source of truth for permissions; the execution layer handles authentication and Perpl order submission.
 
 ## Strategy dashboard
 
@@ -55,4 +57,4 @@ Browser dashboard
      Perpl
 ```
 
-Keep `AGENT_CREDENTIAL` and `QWEN_API_KEY` server-side. Never place them in browser JavaScript or commit them to Git.
+Keep `AGENT_IDENTITY_ACCESS_KEY`, `AGENT_CREDENTIAL`, and `QWEN_API_KEY` server-side. Never place them in browser JavaScript or commit them to Git.
