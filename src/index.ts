@@ -6,7 +6,6 @@ import { startDashboard, type AgentStatus } from './server.js';
 import { perpl } from './perpl.js';
 
 type Json = Record<string, unknown>;
-
 type ModelConfig = { provider: string; apiKey: string; baseUrl: string; model: string };
 
 if (!process.env.PERPL_API_KEY) throw new Error('Missing PERPL_API_KEY');
@@ -53,6 +52,70 @@ async function createCompletion(messages: any[], tools: any[]) {
   }
 }
 
+function compactValue(value: unknown, maxChars = 12000): unknown {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined || serialized.length <= maxChars) return value;
+  return { truncated: true, original_chars: serialized.length, preview: serialized.slice(0, Math.floor(maxChars * 0.75)) };
+}
+
+function compactToolResult(name: string, result: unknown): unknown {
+  if (name === 'get_markets' && result && typeof result === 'object') {
+    const source: any = result;
+    if (Array.isArray(source.markets)) {
+      return compactValue({
+        ...source,
+        markets: source.markets.slice(0, 24).map((market: any) => ({
+          id: market?.id,
+          symbol: market?.symbol ?? market?.name,
+          price: market?.price ?? market?.mark_price ?? market?.index_price,
+          index_price: market?.index_price,
+          mark_price: market?.mark_price,
+          funding: market?.funding ?? market?.funding_rate,
+          ...Object.fromEntries(Object.entries(market ?? {}).filter(([key]) => /leverage|tick|step|min|max|status|contract|order_ttl/i.test(key))),
+        })),
+      }, 12000);
+    }
+  }
+  if (name === 'get_state' && result && typeof result === 'object') {
+    const source: any = result;
+    return compactValue({
+      ...source,
+      accounts: Array.isArray(source.accounts) ? source.accounts.slice(0, 12) : source.accounts,
+      orders: Array.isArray(source.orders) ? source.orders.slice(0, 40) : source.orders,
+      positions: Array.isArray(source.positions) ? source.positions.slice(0, 20) : source.positions,
+    }, 12000);
+  }
+  if (name === 'get_market_candles' && result && typeof result === 'object') {
+    const source: any = result;
+    if (Array.isArray(source.data)) return compactValue({ ...source, data: source.data.slice(-160) }, 14000);
+    if (Array.isArray(source.candles)) return compactValue({ ...source, candles: source.candles.slice(-160) }, 14000);
+  }
+  if (name === 'get_funding' && result && typeof result === 'object') {
+    const source: any = result;
+    if (Array.isArray(source.data)) return compactValue({ ...source, data: source.data.slice(-120) }, 10000);
+    if (Array.isArray(source.funding)) return compactValue({ ...source, funding: source.funding.slice(-120) }, 10000);
+  }
+  if (name === 'web_research' && result && typeof result === 'object') {
+    const source: any = result;
+    return compactValue({
+      query: source.query,
+      answer: typeof source.answer === 'string' ? source.answer.slice(0, 1800) : source.answer,
+      results: Array.isArray(source.results) ? source.results.slice(0, 4).map((item: any) => ({ ...item, content: String(item?.content ?? '').slice(0, 1400) })) : source.results,
+    }, 9000);
+  }
+  if (name === 'get_trading_memory' && Array.isArray(result)) {
+    return result.slice(-8).map((entry: any) => ({
+      timestamp: entry.timestamp,
+      action: entry.action,
+      toolCalls: Array.isArray(entry.toolCalls) ? entry.toolCalls.slice(-12) : [],
+      summary: String(entry.summary ?? '').slice(0, 1400),
+      forecast: entry.forecast ? String(entry.forecast).slice(0, 1000) : undefined,
+      outcome: entry.outcome ? String(entry.outcome).slice(0, 1000) : undefined,
+    }));
+  }
+  return compactValue(result);
+}
+
 const tools = [
   { type: 'function' as const, function: { name: 'get_markets', description: 'Get the live Perpl market context from Perpl itself: markets, prices, funding and trading configuration. Treat this as the primary venue data source.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'get_state', description: 'Get a FRESH authenticated Perpl wallet/account state. This reconnects to Perpl before reading state so balance, account, open orders and positions reflect the latest exchange state, not a stale snapshot.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
@@ -80,21 +143,22 @@ function log(message: string) {
 }
 
 async function runTool(name: string, args: Json): Promise<unknown> {
-  if (name === 'get_markets') return perpl.getMarkets();
-  if (name === 'get_state') return perpl.getState();
-  if (name === 'get_market_candles') return perpl.getMarketCandles(Number(args.market_id), Number(args.resolution_seconds), Number(args.from_ms), Number(args.to_ms));
-  if (name === 'get_funding') return perpl.getFunding(Number(args.market_id), Number(args.from_ms), Number(args.to_ms));
-  if (name === 'get_trading_memory') return loadTradingMemory(Number(args.limit ?? 20));
-  if (name === 'web_research') return webResearch(String(args.query ?? ''), Number(args.max_results ?? 6));
-  if (name === 'place_order') {
+  let result: unknown;
+  if (name === 'get_markets') result = await perpl.getMarkets();
+  else if (name === 'get_state') result = await perpl.getState();
+  else if (name === 'get_market_candles') result = await perpl.getMarketCandles(Number(args.market_id), Number(args.resolution_seconds), Number(args.from_ms), Number(args.to_ms));
+  else if (name === 'get_funding') result = await perpl.getFunding(Number(args.market_id), Number(args.from_ms), Number(args.to_ms));
+  else if (name === 'get_trading_memory') result = await loadTradingMemory(Math.min(Number(args.limit ?? 8), 8));
+  else if (name === 'web_research') result = await webResearch(String(args.query ?? ''), Math.min(Number(args.max_results ?? 4), 4));
+  else if (name === 'place_order') {
     if (!tradingEnabled) throw new Error('Trading is disabled by TRADING_ENABLED=false');
     const leverageHundredths = Number(args.lv ?? 0);
     if (!Number.isFinite(leverageHundredths) || leverageHundredths <= 0) throw new Error('Invalid leverage');
     if (leverageHundredths > maxLeverage * 100) throw new Error(`Requested leverage exceeds MAX_LEVERAGE=${maxLeverage}`);
-    return perpl.placeOrder(args as any);
-  }
-  if (name === 'cancel_order') return perpl.cancelOrder(Number(args.mkt), Number(args.oid));
-  throw new Error(`Unknown tool: ${name}`);
+    result = await perpl.placeOrder(args as any);
+  } else if (name === 'cancel_order') result = await perpl.cancelOrder(Number(args.mkt), Number(args.oid));
+  else throw new Error(`Unknown tool: ${name}`);
+  return compactToolResult(name, result);
 }
 
 let activeCycle: Promise<void> | null = null;
@@ -108,9 +172,8 @@ export async function cycle() {
     const toolNames: string[] = [];
     try {
       const strategy = await loadStrategy();
-      const memory = await loadTradingMemory(20);
-      const fallbackDescription = fallbackModelConfig ? ` Primary=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModelConfig.provider}/${fallbackModelConfig.model}.` : ` Primary=${primaryModel.provider}/${primaryModel.model}; no fallback configured.`;
-      const system = `You are an autonomous Perpl trading agent using the configured model provider.${fallbackDescription}
+      const memory = await loadTradingMemory(8);
+      const system = `You are an autonomous Perpl trading agent using the configured model provider. Primary=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModelConfig ? `${fallbackModelConfig.provider}/${fallbackModelConfig.model}` : 'disabled'}.
 Perpl is the execution venue and the primary source of truth for venue state and market data. Do not substitute generic web data for Perpl-native account, market, candle, or funding data when a Perpl tool can provide it.
 There is no AgentHub execution path.
 Your Perpl API key is server-side and the trading client signs requests with its Ed25519 private key. Never ask for, print, or expose credentials.
@@ -119,13 +182,14 @@ Use a forecasting-first workflow inspired by FutureBench: gather current evidenc
 Do not treat web articles, prediction markets, or model opinions as facts. Prefer primary/first-party sources when possible and seek independent corroboration.
 Before trading, ALWAYS call get_state and use its fresh balance/available_balance/accounts/positions/orders values. Never carry forward an old balance from memory or a previous cycle.
 Use get_market_candles for native Perpl price history and get_funding for native Perpl funding history when relevant to the forecast.
+Keep tool requests focused; do not request unnecessarily large historical ranges because the model context is finite.
 Confirm the account exists, has current funds, is not frozen, and has API forwarding enabled before sending an order.
 Use prior journal entries to identify repeated mistakes or successful patterns, but do not blindly copy prior actions.
 You may buy, sell, cancel, or do nothing. Long entries are ${allowLong ? 'allowed' : 'disabled'}; short entries are ${allowShort ? 'allowed' : 'disabled'}; maximum leverage is ${maxLeverage}x. Trading execution is ${tradingEnabled ? 'enabled' : 'disabled'}.
 Do not force a trade when the evidence does not support one. When evidence is sufficient, choose the best supported long or short setup and execute it rather than defaulting to do nothing.
 Only use exact Perpl order fields supported by the tools. Do not claim success unless a tool returned success.
 
-USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify(memory)}`;
+USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify(compactToolResult('get_trading_memory', memory))}`;
       const messages: any[] = [
         { role: 'system', content: system },
         { role: 'user', content: 'Run one autonomous trading cycle. Research what matters, refresh Perpl account state, inspect native Perpl market/candle/funding data, form explicit forecasts, compare against prior experience, then take an action only when the strategy and evidence support it. Finish with a concise explanation including the key forecast, current account balance, and confidence.' },
