@@ -4,15 +4,40 @@ Qwen is the reasoning layer and AgentHub2 is the authenticated execution layer f
 
 ## What this repo does
 
-On every cycle the agent loads your editable strategy, reads current Perpl market configuration and account state through AgentHub2, lets Qwen decide whether to act, executes only through AgentHub2, and records the result in the dashboard activity log.
+On every cycle the agent loads your editable strategy, reads current Perpl market configuration and account state through AgentHub2, researches current web information, checks its own trading journal, asks Qwen to form explicit probability-weighted forecasts, decides whether to act, executes only through AgentHub2, and records the result in the dashboard activity log.
 
-The app also serves a browser dashboard where you can edit the strategy, enable/disable the loop, run one cycle manually, and inspect recent activity.
+The forecasting workflow is inspired by FutureBench: current information is gathered first, competing hypotheses are weighed, uncertainty is made explicit, and the eventual decision is grounded in time-bound predictions. FutureBench itself is an evaluation benchmark rather than a trading signal source. citeturn459926search0
+
+## Dashboard
+
+The app serves a browser dashboard where you can edit strategy instructions, enable/disable the loop, run a cycle manually, and inspect activity. Your strategy can be plain English: markets to watch, signals, entries/exits, sizing, leverage, invalidation conditions, and when to stay out.
+
+## Live web research
+
+Set `TAVILY_API_KEY` to give the agent a live web-search tool. Qwen can then search for current news, announcements, research, market context, and other information before deciding. The tool returns source titles, URLs, publication dates when available, and extracted snippets.
+
+The agent is instructed to prefer independent corroboration and first-party sources where possible, and not to treat web content or prediction-market opinions as facts.
+
+## Trading memory
+
+Qwen now has a local `data/trading-memory.json` journal. After each cycle it records the cycle result and tool usage. Future cycles can call `get_trading_memory` to review prior decisions and repeated patterns.
+
+This builds historical memory from the point the feature is enabled. AgentHub2's current live account route exposes current positions/orders/account state, but the Qwen journal is what provides persistent cross-cycle context to the reasoning loop.
+
+Because `data/` is git-ignored, persistent deployment storage is recommended when you want the journal and strategy to survive redeploys.
 
 ## Setup
 
-Create `.env` from `.env.example` and set `QWEN_API_KEY`, `QWEN_BASE_URL`, `QWEN_MODEL`, `AGENTHUB_URL`, `AGENT_IDENTITY_ACCESS_KEY`, `AGENT_NAME`, and `DASHBOARD_PASSWORD`.
+Create `.env` from `.env.example` and set:
 
-`AGENT_IDENTITY_ACCESS_KEY` is preferred: Qwen uses it to call AgentHub2's connect endpoint and automatically refresh the 24-hour trading credential. `AGENT_CREDENTIAL` can still be supplied directly when you already have a current agent credential.
+- `QWEN_API_KEY`
+- `QWEN_BASE_URL`
+- `QWEN_MODEL`
+- `TAVILY_API_KEY`
+- `AGENTHUB_URL`
+- `AGENT_IDENTITY_ACCESS_KEY` or `AGENT_CREDENTIAL`
+- `AGENT_NAME`
+- `DASHBOARD_PASSWORD`
 
 Install and run:
 
@@ -25,36 +50,24 @@ Open `http://localhost:3000`.
 
 ## AgentHub2 connection
 
-AgentHub2 exposes `POST /api/agent/connect`. It accepts an identity access key/connection token and returns a short-lived `connection_token` for the created agent. The trading credential is capped at 24 hours, so the Qwen app renews it every 12 hours when `AGENT_IDENTITY_ACCESS_KEY` is configured.
-
-The current AgentHub2 routes are the source of truth for permissions; the execution layer handles authentication and Perpl order submission.
-
-## Strategy dashboard
-
-The dashboard saves your plain-language trading instructions to `data/strategy.md` and injects them into Qwen's context on every cycle. You can write rules for markets, signals, entries, exits, sizing, leverage, no-trade conditions, and handling of existing positions/orders.
-
-The strategy file is git-ignored runtime state. On an ephemeral host it can be lost after a restart/redeploy, so a persistent disk or another durable store is needed for permanent strategy memory.
-
-## Runtime settings
-
-`TRADING_INTERVAL_MS` controls the loop cadence (default 5 minutes). `MAX_TOOL_STEPS` caps Qwen's tool-calling steps per cycle. `AUTONOMOUS_ENABLED=false` starts with the loop disabled.
-
-`DASHBOARD_PASSWORD` protects the browser dashboard with HTTP Basic Auth. Set it for any public deployment.
+AgentHub2 exposes `POST /api/agent/connect`. It accepts an identity access key/connection token and returns a short-lived `connection_token` for the created agent. Its current trading credential lifetime is capped at 24 hours, so the Qwen app refreshes it every 12 hours when `AGENT_IDENTITY_ACCESS_KEY` is configured.
 
 ## Architecture
 
 ```text
-Browser dashboard
-      |
-      v
-   Qwen app
-      |
-      | Qwen tool calls
-      v
-  AgentHub2
-      |
-      v
-     Perpl
+                    current web/news
+                         |
+                         v
+Browser --> Qwen dashboard --> Qwen reasoning
+                         |       |
+                         |       +--> forecast + evidence
+                         |       +--> trading memory
+                         |       +--> Perpl state/markets
+                         v
+                      AgentHub2
+                         |
+                         v
+                        Perpl
 ```
 
-Keep `AGENT_IDENTITY_ACCESS_KEY`, `AGENT_CREDENTIAL`, and `QWEN_API_KEY` server-side. Never place them in browser JavaScript or commit them to Git.
+Keep `AGENT_IDENTITY_ACCESS_KEY`, `AGENT_CREDENTIAL`, `QWEN_API_KEY`, and `TAVILY_API_KEY` server-side. Never put them into browser JavaScript or commit them to Git.
