@@ -1,0 +1,299 @@
+import { randomBytes } from 'node:crypto';
+import * as ed from '@noble/ed25519';
+import WebSocket from 'ws';
+
+const API_URL = (process.env.PERPL_API_URL ?? 'https://app.perpl.xyz/api').replace(/\/$/, '');
+const WS_URL = (process.env.PERPL_WS_URL ?? 'wss://app.perpl.xyz').replace(/\/$/, '');
+const CHAIN_ID = Number(process.env.PERPL_CHAIN_ID ?? 143);
+
+type Json = Record<string, unknown>;
+type Account = { mt?: number; in?: number; id?: number; fr?: boolean; fw?: boolean; lfr?: number; b?: string; lb?: string };
+type State = {
+  account: Account | null;
+  orders: Json[];
+  positions: Json[];
+  headBlock: number | null;
+  sequence: number | null;
+  updatedAt: number;
+};
+
+type OrderInput = {
+  mkt: number;
+  t: number;
+  s: number;
+  lv: number;
+  fl: number;
+  p?: number;
+  a?: string;
+  ms?: number;
+  tif?: number;
+  tp?: number;
+  tpc?: number;
+  tr?: number;
+  lp?: number;
+  bf?: number;
+};
+
+function requireConfig() {
+  const apiKey = process.env.PERPL_API_KEY?.trim();
+  const secret = process.env.PERPL_API_PRIVATE_KEY?.trim() || process.env.PERPL_API_KEY_SECRET?.trim();
+  if (!apiKey) throw new Error('Missing PERPL_API_KEY');
+  if (!secret) throw new Error('Missing PERPL_API_PRIVATE_KEY');
+  return { apiKey, privateKey: decodePrivateKey(secret) };
+}
+
+function decodePrivateKey(value: string): Uint8Array {
+  const normalized = value.trim().replace(/^0x/i, '');
+  if (/^[0-9a-fA-F]{64}$/.test(normalized)) return new Uint8Array(Buffer.from(normalized, 'hex'));
+  try {
+    const bytes = new Uint8Array(Buffer.from(value, 'base64url'));
+    if (bytes.length === 32) return bytes;
+  } catch {}
+  throw new Error('PERPL_API_PRIVATE_KEY must be a 32-byte Ed25519 private key in hex or base64url form');
+}
+
+function object(value: unknown): Json | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Json : null;
+}
+
+function array(value: unknown): Json[] {
+  return Array.isArray(value) ? value.filter((item): item is Json => !!object(item)) : [];
+}
+
+function numeric(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function text(value: unknown): string | null {
+  return typeof value === 'string' ? value : null;
+}
+
+export class PerplClient {
+  private ws?: WebSocket;
+  private requestId = 0;
+  private sequenceId = 0;
+  private state: State = { account: null, orders: [], positions: [], headBlock: null, sequence: null, updatedAt: 0 };
+  private buffer: Json[] = [];
+  private listeners = new Set<(message: Json) => void>();
+  private connectPromise: Promise<void> | null = null;
+  private commandTail: Promise<void> = Promise.resolve();
+
+  private credentials() { return requireConfig(); }
+
+  async getMarkets(): Promise<unknown> {
+    const response = await fetch(`${API_URL}/v1/pub/context`);
+    const textBody = await response.text();
+    let body: unknown;
+    try { body = textBody ? JSON.parse(textBody) : null; } catch { body = textBody; }
+    if (!response.ok) throw new Error(`Perpl market context ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+    return body;
+  }
+
+  async getState(): Promise<unknown> {
+    await this.connect();
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < 3000) {
+      if (this.ready()) return this.publicState();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error('Perpl trading state did not become ready after authentication');
+  }
+
+  async placeOrder(input: OrderInput): Promise<unknown> {
+    return this.withCommandLock(async () => {
+      await this.ensureReady();
+      const accountId = this.accountId();
+      const market = await this.getMarket(input.mkt);
+      const head = this.state.headBlock ?? 0;
+      const lb = input.tif ?? (head > 0 ? head + Number(market?.order_ttl_blocks ?? 0) : 0);
+      const rq = Math.max(this.requestId + 1, this.state.account?.lfr ? this.state.account.lfr + 1 : 0, Date.now());
+      this.requestId = rq;
+      const sn = ++this.sequenceId;
+      return this.sendOrder({ ...input, acc: accountId, rq, sn, lb });
+    });
+  }
+
+  async cancelOrder(mkt: number, oid: number): Promise<unknown> {
+    return this.withCommandLock(async () => {
+      await this.ensureReady();
+      const rq = Math.max(this.requestId + 1, this.state.account?.lfr ? this.state.account.lfr + 1 : 0, Date.now());
+      this.requestId = rq;
+      const sn = ++this.sequenceId;
+      return this.sendOrder({ mkt, acc: this.accountId(), oid, t: 5, p: 0, s: 0, fl: 0, lv: 0, lb: 0, rq, sn });
+    });
+  }
+
+  private async getMarket(mkt: number): Promise<any> {
+    const context: any = await this.getMarkets();
+    return Array.isArray(context?.markets) ? context.markets.find((item: any) => Number(item?.id) === mkt) : undefined;
+  }
+
+  private accountId(): number {
+    const id = numeric(this.state.account?.id);
+    if (id === null) throw new Error('Perpl authenticated wallet has no exchange account');
+    if (this.state.account?.fw === false) throw new Error('Perpl account forwarding is disabled; the account will reject API orders');
+    return id;
+  }
+
+  private ready() {
+    return !!this.state.account && this.state.headBlock !== null && this.state.sequence !== null;
+  }
+
+  private publicState() {
+    return {
+      status: this.ready() ? 'ok' : 'connecting',
+      trading_available: this.ready() && this.state.account?.fw !== false,
+      connector: 'perpl-direct',
+      account: this.state.account,
+      orders: this.state.orders,
+      positions: this.state.positions,
+      head_block: this.state.headBlock,
+      stale: !this.state.updatedAt || Date.now() - this.state.updatedAt > 5000,
+      sequence_gap: false,
+      last_message_at: this.state.updatedAt ? new Date(this.state.updatedAt).toISOString() : null,
+    };
+  }
+
+  private async ensureReady() {
+    await this.connect();
+    if (!this.ready()) await this.getState();
+    if (!this.ready()) throw new Error('Perpl trading state is unavailable');
+  }
+
+  private async connect() {
+    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.connectPromise) return this.connectPromise;
+    this.connectPromise = this.openSocket();
+    try { await this.connectPromise; } finally { this.connectPromise = null; }
+  }
+
+  private async openSocket() {
+    const { apiKey, privateKey } = this.credentials();
+    const ws = new WebSocket(`${WS_URL}/ws/v1/trading`);
+    this.ws = ws;
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (!settled) { settled = true; reject(new Error('Perpl trading WebSocket authentication timeout')); }
+      }, 6000);
+
+      ws.once('open', async () => {
+        try {
+          const timestamp = Date.now().toString();
+          const nonce = randomBytes(16).toString('base64url');
+          const canonical = [CHAIN_ID, 'trading-ws-signin', timestamp, nonce].join('\n');
+          const signature = await ed.signAsync(Buffer.from(canonical), privateKey);
+          ws.send(JSON.stringify({ mt: 29, chain_id: CHAIN_ID, api_key: apiKey, timestamp, nonce, signature: Buffer.from(signature).toString('base64url') }));
+        } catch (error) {
+          if (!settled) { settled = true; clearTimeout(timeout); reject(error); }
+        }
+      });
+      ws.on('message', (raw) => {
+        let message: Json;
+        try { message = JSON.parse(raw.toString()) as Json; } catch { return; }
+        this.consume(message);
+        if (Number(message.mt) === 19 && !settled) { settled = true; clearTimeout(timeout); resolve(); }
+      });
+      ws.once('error', (error) => {
+        if (!settled) { settled = true; clearTimeout(timeout); reject(error); }
+      });
+      ws.once('close', () => {
+        this.ws = undefined;
+        if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); }
+      });
+    });
+  }
+
+  private consume(message: Json) {
+    this.state.updatedAt = Date.now();
+    if (Number(message.mt) === 19) {
+      const accounts = array(message.as);
+      const account = object(accounts[0]);
+      if (account) {
+        this.state.account = account as Account;
+        const lfr = numeric(account.lfr);
+        if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
+      }
+      this.state.sequence = numeric(message.sn);
+    } else if (Number(message.mt) === 20 || Number(message.mt) === 21) {
+      const account = object(message.d);
+      if (account) this.state.account = { ...this.state.account, ...account } as Account;
+      const lfr = numeric(account?.lfr);
+      if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
+    } else if (Number(message.mt) === 23) {
+      this.state.orders = array(message.d);
+    } else if (Number(message.mt) === 24) {
+      const item = object(message.d);
+      if (item) this.applyUpdate(this.state.orders, item);
+    } else if (Number(message.mt) === 26) {
+      this.state.positions = array(message.d);
+    } else if (Number(message.mt) === 27) {
+      const item = object(message.d);
+      if (item) this.applyUpdate(this.state.positions, item);
+    } else if (Number(message.mt) === 100) {
+      const sequence = numeric(message.sn);
+      const head = numeric(message.h);
+      if (sequence !== null && this.state.sequence !== null && sequence !== this.state.sequence + 1) {
+        this.state.account = null;
+        this.state.orders = [];
+        this.state.positions = [];
+      } else if (sequence !== null) this.state.sequence = sequence;
+      if (head !== null) this.state.headBlock = head;
+    }
+    if (this.listeners.size) {
+      for (const listener of this.listeners) listener(message);
+    } else {
+      this.buffer.push(message);
+      if (this.buffer.length > 250) this.buffer.shift();
+    }
+  }
+
+  private applyUpdate(target: Json[], update: Json) {
+    const keyFields = ['oid', 'id', 'pid', 'position_id'];
+    const key = keyFields.find((field) => update[field] !== undefined);
+    if (!key) { target.push(update); return; }
+    const value = String(update[key]);
+    const index = target.findIndex((item) => String(item[key]) === value);
+    if (update.r === true) { if (index >= 0) target.splice(index, 1); return; }
+    if (index >= 0) target[index] = update; else target.push(update);
+  }
+
+  private async sendOrder(order: Json): Promise<unknown> {
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Perpl trading WebSocket is not open');
+    return new Promise((resolve, reject) => {
+      const sn = Number(order.sn);
+      const rq = Number(order.rq);
+      const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Perpl order response timeout')); }, 10000);
+      const unsubscribe = this.onMessage((message) => {
+        if (Number(message.mt) === 3 && Number(message.cid) === sn) {
+          const status = object(message.status);
+          if (numeric(status?.code) !== 0) {
+            clearTimeout(timeout); unsubscribe(); reject(new Error(String(status?.error ?? 'Perpl order rejected')));
+          }
+          return;
+        }
+        if (Number(message.mt) !== 24 || Number(message.rq) !== rq) return;
+        clearTimeout(timeout); unsubscribe(); resolve(message);
+      });
+      ws.send(JSON.stringify({ ...order, mt: 22 }));
+    });
+  }
+
+  private onMessage(listener: (message: Json) => void) {
+    this.listeners.add(listener);
+    if (this.buffer.length) {
+      const messages = this.buffer.splice(0, this.buffer.length);
+      for (const message of messages) listener(message);
+    }
+    return () => this.listeners.delete(listener);
+  }
+
+  private withCommandLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.commandTail.then(operation, operation);
+    this.commandTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+}
+
+export const perpl = new PerplClient();
