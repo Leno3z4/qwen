@@ -57,9 +57,9 @@ export class PerplClient {
   }
 
   async getState(): Promise<unknown> {
-    await this.connect();
+    await this.connect(true);
     const startedAt = Date.now();
-    while (Date.now() - startedAt < 3000) {
+    while (Date.now() - startedAt < 5000) {
       if (this.ready()) return this.publicState();
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
@@ -157,7 +157,13 @@ export class PerplClient {
 
   private async ensureReady() { await this.connect(); if (!this.ready()) await this.getState(); if (!this.ready()) throw new Error('Perpl trading state is unavailable'); }
 
-  private async connect() {
+  private async connect(forceRefresh = false) {
+    if (forceRefresh && this.ws?.readyState === WebSocket.OPEN) {
+      try { this.ws.close(); } catch {}
+      this.ws = undefined;
+      this.state = { walletAddress: null, accounts: [], account: null, orders: [], positions: [], headBlock: null, sequence: null, updatedAt: 0 };
+      this.buffer = [];
+    }
     if (this.ws?.readyState === WebSocket.OPEN) return;
     if (this.connectPromise) return this.connectPromise;
     this.connectPromise = this.openSocket();
