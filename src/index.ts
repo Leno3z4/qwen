@@ -16,7 +16,7 @@ if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
 
 const qwen = new OpenAI({
   apiKey: process.env.QWEN_API_KEY,
-  baseURL: process.env.QWEN_BASE_URL ?? 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
+  baseURL: process.env.QWEN_BASE_URL ?? 'https://openrouter.ai/api/v1',
 });
 
 const tools = [
@@ -41,7 +41,7 @@ async function connectAgent(): Promise<void> {
   const response = await fetch(`${baseUrl}/api/agent/connect`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ identity_access_key: agentAccessKey, agent_name: agentName }),
+    body: JSON.stringify({ identity_access_key: agentAccessKey, agent_name: agentName, connector: 'perpl' }),
   });
   const data: any = await response.json().catch(() => ({}));
   if (!response.ok || typeof data.connection_token !== 'string') {
@@ -120,7 +120,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
       const maxSteps = Number(process.env.MAX_TOOL_STEPS ?? 10);
       let finalResult = 'No final response.';
       for (let step = 0; step < maxSteps; step++) {
-        const response = await qwen.chat.completions.create({ model: process.env.QWEN_MODEL ?? 'qwen3-max', messages, tools, tool_choice: 'auto' });
+        const response = await qwen.chat.completions.create({ model: process.env.QWEN_MODEL ?? 'qwen/qwen3-235b-a22b-2507:free', messages, tools, tool_choice: 'auto' });
         const message: any = response.choices[0]?.message;
         if (!message) throw new Error('Qwen returned no message');
         messages.push(message);
