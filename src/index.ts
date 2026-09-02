@@ -6,10 +6,16 @@ import { startDashboard, type AgentStatus } from './server.js';
 
 type Json = Record<string, unknown>;
 
-const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2-gray.vercel.app').replace(/\/$/, '');
+type AgentConnection = {
+  identityId: string;
+  agentId: string;
+  connectionToken: string;
+  expiresAt: number;
+};
+
+const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2.onrender.com').replace(/\/$/, '');
 const agentAccessKey = process.env.AGENTHUB_ACCESS_KEY;
-let connectionToken: string | null = null;
-let connectionExpiresAt = 0;
+let connection: AgentConnection | null = null;
 const agentName = process.env.AGENT_NAME ?? 'Qwen Autonomous Trader';
 if (!agentAccessKey) throw new Error('Missing AGENTHUB_ACCESS_KEY');
 if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
@@ -37,7 +43,7 @@ function log(message: string) {
   status.logs = status.logs.slice(0, 80);
 }
 
-async function connectAgent(): Promise<void> {
+async function connectAgent(): Promise<Pick<AgentConnection, 'identityId' | 'agentId' | 'expiresAt'>> {
   const response = await fetch(`${baseUrl}/api/agent/connect`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -47,14 +53,26 @@ async function connectAgent(): Promise<void> {
   if (!response.ok || typeof data.connection_token !== 'string') {
     throw new Error(`AgentHub2 connect failed (${response.status}): ${JSON.stringify(data)}`);
   }
-  connectionToken = data.connection_token;
-  connectionExpiresAt = Number(data.expires_at ?? 0);
-  log(`AgentHub2 connection token refreshed; expires ${connectionExpiresAt ? new Date(connectionExpiresAt).toISOString() : 'unknown'}.`);
+  if (typeof data.identity_id !== 'string' || typeof data.agent_id !== 'string') {
+    throw new Error('AgentHub2 connect response missing identity_id or agent_id');
+  }
+  connection = {
+    identityId: data.identity_id,
+    agentId: data.agent_id,
+    connectionToken: data.connection_token,
+    expiresAt: Number(data.expires_at ?? 0),
+  };
+  log(`AgentHub2 connected as agent ${connection.agentId}. Token refreshed; expires ${connection.expiresAt ? new Date(connection.expiresAt).toISOString() : 'unknown'}.`);
+  return {
+    identityId: connection.identityId,
+    agentId: connection.agentId,
+    expiresAt: connection.expiresAt,
+  };
 }
 
 async function ensureConnectionToken(): Promise<void> {
   const refreshSkewMs = 60_000;
-  if (!connectionToken || (connectionExpiresAt > 0 && Date.now() + refreshSkewMs >= connectionExpiresAt)) {
+  if (!connection || (connection.expiresAt > 0 && Date.now() + refreshSkewMs >= connection.expiresAt)) {
     await connectAgent();
   }
 }
@@ -64,7 +82,7 @@ async function agenthub(path: string, init: RequestInit = {}): Promise<unknown> 
   const request = async () => fetch(`${baseUrl}${path}`, {
     ...init,
     headers: {
-      authorization: `Bearer ${connectionToken}`,
+      authorization: `Bearer ${connection!.connectionToken}`,
       'content-type': 'application/json',
       ...(init.headers ?? {}),
     },
