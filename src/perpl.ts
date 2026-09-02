@@ -246,9 +246,9 @@ export class PerplClient {
       const lfr = numeric(account?.lfr);
       if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
     } else if (Number(message.mt) === 23) this.state.orders = array(message.d);
-    else if (Number(message.mt) === 24) { const item = object(message.d); if (item) this.applyUpdate(this.state.orders, item); }
+    else if (Number(message.mt) === 24) { const item = object(message.d); if (item) this.applyUpdate(this.state.orders, item); else { for (const item of array(message.d)) this.applyUpdate(this.state.orders, item); } }
     else if (Number(message.mt) === 26) this.state.positions = array(message.d);
-    else if (Number(message.mt) === 27) { const item = object(message.d); if (item) this.applyUpdate(this.state.positions, item); }
+    else if (Number(message.mt) === 27) { const item = object(message.d); if (item) this.applyUpdate(this.state.positions, item); else { for (const item of array(message.d)) this.applyUpdate(this.state.positions, item); } }
     else if (Number(message.mt) === 100) {
       const sequence = numeric(message.sn);
       const head = numeric(message.h);
@@ -270,22 +270,47 @@ export class PerplClient {
     if (index >= 0) target[index] = update; else target.push(update);
   }
 
+  private orderFromMessage(message: Json, rq: number): Json | null {
+    const matches = [message, ...array(message.d)].filter((item) => Number(item.rq) === rq);
+    return matches.length ? matches[matches.length - 1] : null;
+  }
+
   private async sendOrder(order: Json): Promise<unknown> {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Perpl trading WebSocket is not open');
     return new Promise((resolve, reject) => {
       const sn = Number(order.sn); const rq = Number(order.rq);
-      const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Perpl order response timeout')); }, 10000);
+      let settled = false;
+      const finishReject = (error: Error) => { if (settled) return; settled = true; clearTimeout(timeout); unsubscribe(); reject(error); };
+      const finishResolve = (value: unknown) => { if (settled) return; settled = true; clearTimeout(timeout); unsubscribe(); resolve(value); };
+      const timeout = setTimeout(() => finishReject(new Error(`Perpl order response timeout (sn=${sn}, rq=${rq})`)), 10000);
       const unsubscribe = this.onMessage((message) => {
         if (Number(message.mt) === 3 && Number(message.cid) === sn) {
           const status = object(message.status);
-          if (numeric(status?.code) !== 0) { clearTimeout(timeout); unsubscribe(); reject(new Error(String(status?.error ?? 'Perpl order rejected'))); }
+          const code = numeric(status?.code);
+          if (code !== 0) {
+            finishReject(new Error(`Perpl order gateway rejected (code=${code ?? 'unknown'}): ${String(status?.error ?? 'unknown error')}`));
+          }
           return;
         }
-        if (Number(message.mt) !== 24 || Number(message.rq) !== rq) return;
-        clearTimeout(timeout); unsubscribe(); resolve(message);
+        if (Number(message.mt) !== 24) return;
+        const orderUpdate = this.orderFromMessage(message, rq);
+        if (!orderUpdate) return;
+        const status = numeric(orderUpdate.st);
+        if (status === 7) {
+          const reason = orderUpdate.sr ?? orderUpdate.fr ?? 'unknown order failure';
+          finishReject(new Error(`Perpl order failed (sr=${String(reason)})`));
+          return;
+        }
+        if (status !== null && [2, 3, 4, 5, 8, 9, 10].includes(status)) {
+          finishResolve(orderUpdate);
+        }
       });
-      ws.send(JSON.stringify({ ...order, mt: 22 }));
+      try {
+        ws.send(JSON.stringify({ ...order, mt: 22 }));
+      } catch (error) {
+        finishReject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
