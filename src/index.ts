@@ -36,6 +36,13 @@ const tools = [
   } },
 ];
 
+function log(message: string) {
+  const line = `[${new Date().toISOString()}] ${message}`;
+  console.log(line);
+  status.logs.unshift(line);
+  status.logs = status.logs.slice(0, 60);
+}
+
 async function connectAgent(): Promise<void> {
   if (!identityAccessKey) throw new Error('Cannot renew AgentHub2 credential without AGENT_IDENTITY_ACCESS_KEY');
   const response = await fetch(`${baseUrl}/api/agent/connect`, {
@@ -90,13 +97,6 @@ const status: AgentStatus = {
   lastError: null,
   logs: [],
 };
-
-function log(message: string) {
-  const line = `[${new Date().toISOString()}] ${message}`;
-  console.log(line);
-  status.logs.unshift(line);
-  status.logs = status.logs.slice(0, 60);
-}
 
 let activeCycle: Promise<void> | null = null;
 
@@ -158,7 +158,7 @@ async function main() {
   });
 
   if (!agentCredential && identityAccessKey) await connectAgent();
-  await cycle();
+  if (status.enabled) await cycle();
 
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => {
