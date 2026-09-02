@@ -1,11 +1,11 @@
 {
   "name": "qwen-autonomous-agent",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "start": "tsx src/index.ts"
+    "dev": "tsx src/agent.ts",
+    "start": "tsx src/agent.ts"
   },
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
