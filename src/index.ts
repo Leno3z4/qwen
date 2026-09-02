@@ -9,12 +9,14 @@ type Json = Record<string, unknown>;
 
 if (!process.env.PERPL_API_KEY) throw new Error('Missing PERPL_API_KEY');
 if (!process.env.PERPL_API_PRIVATE_KEY && !process.env.PERPL_API_KEY_SECRET) throw new Error('Missing PERPL_API_PRIVATE_KEY');
-if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
 
-const qwen = new OpenAI({
-  apiKey: process.env.QWEN_API_KEY,
-  baseURL: process.env.QWEN_BASE_URL ?? 'https://openrouter.ai/api/v1',
-});
+const modelProvider = (process.env.MODEL_PROVIDER ?? 'groq').trim().toLowerCase();
+const modelApiKey = modelProvider === 'groq' ? process.env.GROQ_API_KEY : process.env.MODEL_API_KEY ?? process.env.QWEN_API_KEY;
+const modelBaseUrl = process.env.MODEL_BASE_URL ?? (modelProvider === 'groq' ? 'https://api.groq.com/openai/v1' : process.env.QWEN_BASE_URL ?? 'https://openrouter.ai/api/v1');
+const modelName = process.env.MODEL_NAME ?? (modelProvider === 'groq' ? 'openai/gpt-oss-120b' : process.env.QWEN_MODEL ?? 'qwen/qwen3-235b-a22b-2507:free');
+if (!modelApiKey) throw new Error(modelProvider === 'groq' ? 'Missing GROQ_API_KEY' : 'Missing MODEL_API_KEY/QWEN_API_KEY');
+
+const qwen = new OpenAI({ apiKey: modelApiKey, baseURL: modelBaseUrl });
 
 const tools = [
   { type: 'function' as const, function: { name: 'get_markets', description: 'Get the live Perpl market context from Perpl itself: markets, prices, funding and trading configuration. Treat this as the primary venue data source.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
@@ -72,9 +74,9 @@ export async function cycle() {
     try {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(20);
-      const system = `You are an autonomous Perpl trading agent with DIRECT access to the Perpl API.
+      const system = `You are an autonomous Perpl trading agent using the ${modelProvider} model provider with DIRECT access to the Perpl API.
 Perpl is the execution venue and the primary source of truth for venue state and market data. Do not substitute generic web data for Perpl-native account, market, candle, or funding data when a Perpl tool can provide it.
-Qwen is the reasoning layer and Perpl is the execution venue. There is no AgentHub execution path.
+There is no AgentHub execution path.
 Your Perpl API key is server-side and the trading client signs requests with its Ed25519 private key. Never ask for, print, or expose credentials.
 Use the user strategy as the governing instruction set.
 Use a forecasting-first workflow inspired by FutureBench: gather current evidence from Perpl plus the live web, form explicit probability-weighted hypotheses with a time horizon, identify disconfirming evidence, then decide whether the evidence justifies an action.
@@ -95,9 +97,9 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
       const maxSteps = Number(process.env.MAX_TOOL_STEPS ?? 10);
       let finalResult = 'No final response.';
       for (let step = 0; step < maxSteps; step++) {
-        const response = await qwen.chat.completions.create({ model: process.env.QWEN_MODEL ?? 'qwen/qwen3-235b-a22b-2507:free', messages, tools, tool_choice: 'auto' });
+        const response = await qwen.chat.completions.create({ model: modelName, messages, tools, tool_choice: 'auto' });
         const message: any = response.choices[0]?.message;
-        if (!message) throw new Error('Qwen returned no message');
+        if (!message) throw new Error('Model returned no message');
         messages.push(message);
         if (!message.tool_calls?.length) { finalResult = String(message.content ?? finalResult); break; }
         for (const call of message.tool_calls) {
@@ -107,7 +109,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
           catch (error) { result = { error: error instanceof Error ? error.message : String(error) }; }
           messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
         }
-        if (step === maxSteps - 1) throw new Error('Qwen exceeded MAX_TOOL_STEPS');
+        if (step === maxSteps - 1) throw new Error('Model exceeded MAX_TOOL_STEPS');
       }
       status.lastResult = finalResult;
       log(finalResult);
@@ -126,7 +128,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
 
 async function main() {
   startDashboard(cycle, () => ({ ...status, logs: [...status.logs] }), (enabled) => { status.enabled = enabled; log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.'); });
-  log(`Direct Perpl trading client configured. AgentHub2 is not used for execution. trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
+  log(`Direct Perpl trading client configured. provider=${modelProvider} model=${modelName} trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
