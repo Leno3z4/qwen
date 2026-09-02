@@ -14,11 +14,22 @@ type AgentConnection = {
 };
 
 const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2.onrender.com').replace(/\/$/, '');
-const agentAccessKey = process.env.AGENTHUB_ACCESS_KEY;
-let connection: AgentConnection | null = null;
-const agentName = process.env.AGENT_NAME ?? 'Qwen Autonomous Trader';
-if (!agentAccessKey) throw new Error('Missing AGENTHUB_ACCESS_KEY');
+const identityId = process.env.AGENTHUB_IDENTITY_ID;
+const agentId = process.env.AGENTHUB_AGENT_ID;
+const connectionToken = process.env.AGENTHUB_CONNECTION_TOKEN;
+const connectionExpiresAt = Number(process.env.AGENTHUB_CONNECTION_EXPIRES_AT ?? 0);
+
+if (!identityId) throw new Error('Missing AGENTHUB_IDENTITY_ID');
+if (!agentId) throw new Error('Missing AGENTHUB_AGENT_ID');
+if (!connectionToken) throw new Error('Missing AGENTHUB_CONNECTION_TOKEN');
 if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
+
+const connection: AgentConnection = {
+  identityId,
+  agentId,
+  connectionToken,
+  expiresAt: connectionExpiresAt,
+};
 
 const qwen = new OpenAI({
   apiKey: process.env.QWEN_API_KEY,
@@ -43,55 +54,22 @@ function log(message: string) {
   status.logs = status.logs.slice(0, 80);
 }
 
-async function connectAgent(): Promise<Pick<AgentConnection, 'identityId' | 'agentId' | 'expiresAt'>> {
-  const response = await fetch(`${baseUrl}/api/agent/connect`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ identity_access_key: agentAccessKey, agent_name: agentName, connector: 'perpl' }),
-  });
-  const data: any = await response.json().catch(() => ({}));
-  if (!response.ok || typeof data.connection_token !== 'string') {
-    throw new Error(`AgentHub2 connect failed (${response.status}): ${JSON.stringify(data)}`);
-  }
-  if (typeof data.identity_id !== 'string' || typeof data.agent_id !== 'string') {
-    throw new Error('AgentHub2 connect response missing identity_id or agent_id');
-  }
-  connection = {
-    identityId: data.identity_id,
-    agentId: data.agent_id,
-    connectionToken: data.connection_token,
-    expiresAt: Number(data.expires_at ?? 0),
-  };
-  log(`AgentHub2 connected as agent ${connection.agentId}. Token refreshed; expires ${connection.expiresAt ? new Date(connection.expiresAt).toISOString() : 'unknown'}.`);
-  return {
-    identityId: connection.identityId,
-    agentId: connection.agentId,
-    expiresAt: connection.expiresAt,
-  };
-}
-
 async function ensureConnectionToken(): Promise<void> {
-  const refreshSkewMs = 60_000;
-  if (!connection || (connection.expiresAt > 0 && Date.now() + refreshSkewMs >= connection.expiresAt)) {
-    await connectAgent();
+  if (connection.expiresAt > 0 && Date.now() >= connection.expiresAt) {
+    throw new Error('AGENTHUB_CONNECTION_TOKEN has expired. Update the Render environment variable with a newly issued token.');
   }
 }
 
 async function agenthub(path: string, init: RequestInit = {}): Promise<unknown> {
   await ensureConnectionToken();
-  const request = async () => fetch(`${baseUrl}${path}`, {
+  const response = await fetch(`${baseUrl}${path}`, {
     ...init,
     headers: {
-      authorization: `Bearer ${connection!.connectionToken}`,
+      authorization: `Bearer ${connection.connectionToken}`,
       'content-type': 'application/json',
       ...(init.headers ?? {}),
     },
   });
-  let response = await request();
-  if (response.status === 401) {
-    await connectAgent();
-    response = await request();
-  }
   const text = await response.text();
   let body: unknown;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -123,6 +101,7 @@ export async function cycle() {
       const memory = await loadTradingMemory(20);
       const system = `You are an autonomous Perpl trading agent operating through AgentHub2.
 AgentHub2 is the execution and authorization layer. Never bypass it and never invent exchange/account data.
+The active AgentHub identity_id is ${connection.identityId} and agent_id is ${connection.agentId}.
 Use the user strategy as the governing instruction set.
 Use a forecasting-first workflow inspired by FutureBench: gather current evidence from the web, form explicit probability-weighted hypotheses with a time horizon, identify disconfirming evidence, then decide whether the evidence justifies an action.
 Do not treat web articles, prediction markets, or model opinions as facts. Prefer primary/first-party sources when possible and seek independent corroboration.
@@ -169,7 +148,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
 
 async function main() {
   startDashboard(cycle, () => ({ ...status, logs: [...status.logs] }), (enabled) => { status.enabled = enabled; log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.'); });
-  await connectAgent();
+  log(`AgentHub2 connection loaded for agent ${connection.agentId}; identity ${connection.identityId}.`);
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
