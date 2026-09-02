@@ -8,31 +8,8 @@ const CHAIN_ID = Number(process.env.PERPL_CHAIN_ID ?? 143);
 
 type Json = Record<string, unknown>;
 type Account = { mt?: number; in?: number; id?: number; fr?: boolean; fw?: boolean; lfr?: number; b?: string; lb?: string };
-type State = {
-  account: Account | null;
-  orders: Json[];
-  positions: Json[];
-  headBlock: number | null;
-  sequence: number | null;
-  updatedAt: number;
-};
-
-type OrderInput = {
-  mkt: number;
-  t: number;
-  s: number;
-  lv: number;
-  fl: number;
-  p?: number;
-  a?: string;
-  ms?: number;
-  tif?: number;
-  tp?: number;
-  tpc?: number;
-  tr?: number;
-  lp?: number;
-  bf?: number;
-};
+type State = { account: Account | null; orders: Json[]; positions: Json[]; headBlock: number | null; sequence: number | null; updatedAt: number };
+type OrderInput = { mkt: number; t: number; s: number; lv: number; fl: number; p?: number; a?: string; ms?: number; tif?: number; tp?: number; tpc?: number; tr?: number; lp?: number; bf?: number };
 
 function requireConfig() {
   const apiKey = process.env.PERPL_API_KEY?.trim();
@@ -55,18 +32,8 @@ function decodePrivateKey(value: string): Uint8Array {
 function object(value: unknown): Json | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Json : null;
 }
-
-function array(value: unknown): Json[] {
-  return Array.isArray(value) ? value.filter((item): item is Json => !!object(item)) : [];
-}
-
-function numeric(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function text(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
-}
+function array(value: unknown): Json[] { return Array.isArray(value) ? value.filter((item): item is Json => !!object(item)) : []; }
+function numeric(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
 
 export class PerplClient {
   private ws?: WebSocket;
@@ -78,13 +45,11 @@ export class PerplClient {
   private connectPromise: Promise<void> | null = null;
   private commandTail: Promise<void> = Promise.resolve();
 
-  private credentials() { return requireConfig(); }
-
   async getMarkets(): Promise<unknown> {
     const response = await fetch(`${API_URL}/v1/pub/context`);
-    const textBody = await response.text();
+    const text = await response.text();
     let body: unknown;
-    try { body = textBody ? JSON.parse(textBody) : null; } catch { body = textBody; }
+    try { body = text ? JSON.parse(text) : null; } catch { body = text; }
     if (!response.ok) throw new Error(`Perpl market context ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
     return body;
   }
@@ -105,7 +70,7 @@ export class PerplClient {
       const accountId = this.accountId();
       const market = await this.getMarket(input.mkt);
       const head = this.state.headBlock ?? 0;
-      const lb = input.tif ?? (head > 0 ? head + Number(market?.order_ttl_blocks ?? 0) : 0);
+      const lb = head > 0 ? head + Number(market?.order_ttl_blocks ?? 0) : 0;
       const rq = Math.max(this.requestId + 1, this.state.account?.lfr ? this.state.account.lfr + 1 : 0, Date.now());
       this.requestId = rq;
       const sn = ++this.sequenceId;
@@ -131,18 +96,17 @@ export class PerplClient {
   private accountId(): number {
     const id = numeric(this.state.account?.id);
     if (id === null) throw new Error('Perpl authenticated wallet has no exchange account');
-    if (this.state.account?.fw === false) throw new Error('Perpl account forwarding is disabled; the account will reject API orders');
+    if (this.state.account?.fr === true) throw new Error('Perpl account is frozen; refusing to place API order');
+    if (this.state.account?.fw === false) throw new Error('Perpl account forwarding is disabled; API orders will be rejected');
     return id;
   }
 
-  private ready() {
-    return !!this.state.account && this.state.headBlock !== null && this.state.sequence !== null;
-  }
+  private ready() { return !!this.state.account && this.state.headBlock !== null && this.state.sequence !== null; }
 
   private publicState() {
     return {
       status: this.ready() ? 'ok' : 'connecting',
-      trading_available: this.ready() && this.state.account?.fw !== false,
+      trading_available: this.ready() && this.state.account?.fr !== true && this.state.account?.fw !== false,
       connector: 'perpl-direct',
       account: this.state.account,
       orders: this.state.orders,
@@ -154,11 +118,7 @@ export class PerplClient {
     };
   }
 
-  private async ensureReady() {
-    await this.connect();
-    if (!this.ready()) await this.getState();
-    if (!this.ready()) throw new Error('Perpl trading state is unavailable');
-  }
+  private async ensureReady() { await this.connect(); if (!this.ready()) await this.getState(); if (!this.ready()) throw new Error('Perpl trading state is unavailable'); }
 
   private async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) return;
@@ -168,15 +128,12 @@ export class PerplClient {
   }
 
   private async openSocket() {
-    const { apiKey, privateKey } = this.credentials();
+    const { apiKey, privateKey } = requireConfig();
     const ws = new WebSocket(`${WS_URL}/ws/v1/trading`);
     this.ws = ws;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      const timeout = setTimeout(() => {
-        if (!settled) { settled = true; reject(new Error('Perpl trading WebSocket authentication timeout')); }
-      }, 6000);
-
+      const timeout = setTimeout(() => { if (!settled) { settled = true; reject(new Error('Perpl trading WebSocket authentication timeout')); } }, 6000);
       ws.once('open', async () => {
         try {
           const timestamp = Date.now().toString();
@@ -194,21 +151,15 @@ export class PerplClient {
         this.consume(message);
         if (Number(message.mt) === 19 && !settled) { settled = true; clearTimeout(timeout); resolve(); }
       });
-      ws.once('error', (error) => {
-        if (!settled) { settled = true; clearTimeout(timeout); reject(error); }
-      });
-      ws.once('close', () => {
-        this.ws = undefined;
-        if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); }
-      });
+      ws.once('error', (error) => { if (!settled) { settled = true; clearTimeout(timeout); reject(error); } });
+      ws.once('close', () => { this.ws = undefined; if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); } });
     });
   }
 
   private consume(message: Json) {
     this.state.updatedAt = Date.now();
     if (Number(message.mt) === 19) {
-      const accounts = array(message.as);
-      const account = object(accounts[0]);
+      const account = object(array(message.as)[0]);
       if (account) {
         this.state.account = account as Account;
         const lfr = numeric(account.lfr);
@@ -220,37 +171,24 @@ export class PerplClient {
       if (account) this.state.account = { ...this.state.account, ...account } as Account;
       const lfr = numeric(account?.lfr);
       if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
-    } else if (Number(message.mt) === 23) {
-      this.state.orders = array(message.d);
-    } else if (Number(message.mt) === 24) {
-      const item = object(message.d);
-      if (item) this.applyUpdate(this.state.orders, item);
-    } else if (Number(message.mt) === 26) {
-      this.state.positions = array(message.d);
-    } else if (Number(message.mt) === 27) {
-      const item = object(message.d);
-      if (item) this.applyUpdate(this.state.positions, item);
-    } else if (Number(message.mt) === 100) {
+    } else if (Number(message.mt) === 23) this.state.orders = array(message.d);
+    else if (Number(message.mt) === 24) { const item = object(message.d); if (item) this.applyUpdate(this.state.orders, item); }
+    else if (Number(message.mt) === 26) this.state.positions = array(message.d);
+    else if (Number(message.mt) === 27) { const item = object(message.d); if (item) this.applyUpdate(this.state.positions, item); }
+    else if (Number(message.mt) === 100) {
       const sequence = numeric(message.sn);
       const head = numeric(message.h);
       if (sequence !== null && this.state.sequence !== null && sequence !== this.state.sequence + 1) {
-        this.state.account = null;
-        this.state.orders = [];
-        this.state.positions = [];
+        this.state.account = null; this.state.orders = []; this.state.positions = []; this.state.headBlock = null; this.state.sequence = null;
       } else if (sequence !== null) this.state.sequence = sequence;
       if (head !== null) this.state.headBlock = head;
     }
-    if (this.listeners.size) {
-      for (const listener of this.listeners) listener(message);
-    } else {
-      this.buffer.push(message);
-      if (this.buffer.length > 250) this.buffer.shift();
-    }
+    if (this.listeners.size) for (const listener of this.listeners) listener(message);
+    else { this.buffer.push(message); if (this.buffer.length > 250) this.buffer.shift(); }
   }
 
   private applyUpdate(target: Json[], update: Json) {
-    const keyFields = ['oid', 'id', 'pid', 'position_id'];
-    const key = keyFields.find((field) => update[field] !== undefined);
+    const key = ['oid', 'id', 'pid', 'position_id'].find((field) => update[field] !== undefined);
     if (!key) { target.push(update); return; }
     const value = String(update[key]);
     const index = target.findIndex((item) => String(item[key]) === value);
@@ -262,15 +200,12 @@ export class PerplClient {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('Perpl trading WebSocket is not open');
     return new Promise((resolve, reject) => {
-      const sn = Number(order.sn);
-      const rq = Number(order.rq);
+      const sn = Number(order.sn); const rq = Number(order.rq);
       const timeout = setTimeout(() => { unsubscribe(); reject(new Error('Perpl order response timeout')); }, 10000);
       const unsubscribe = this.onMessage((message) => {
         if (Number(message.mt) === 3 && Number(message.cid) === sn) {
           const status = object(message.status);
-          if (numeric(status?.code) !== 0) {
-            clearTimeout(timeout); unsubscribe(); reject(new Error(String(status?.error ?? 'Perpl order rejected')));
-          }
+          if (numeric(status?.code) !== 0) { clearTimeout(timeout); unsubscribe(); reject(new Error(String(status?.error ?? 'Perpl order rejected'))); }
           return;
         }
         if (Number(message.mt) !== 24 || Number(message.rq) !== rq) return;
@@ -282,10 +217,7 @@ export class PerplClient {
 
   private onMessage(listener: (message: Json) => void) {
     this.listeners.add(listener);
-    if (this.buffer.length) {
-      const messages = this.buffer.splice(0, this.buffer.length);
-      for (const message of messages) listener(message);
-    }
+    if (this.buffer.length) { const messages = this.buffer.splice(0, this.buffer.length); for (const message of messages) listener(message); }
     return () => this.listeners.delete(listener);
   }
 
