@@ -6,8 +6,10 @@ import { startDashboard, type AgentStatus } from './server.js';
 type Json = Record<string, unknown>;
 
 const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2-gray.vercel.app').replace(/\/$/, '');
-const credential = process.env.AGENT_CREDENTIAL;
-if (!credential) throw new Error('Missing AGENT_CREDENTIAL');
+let agentCredential = process.env.AGENT_CREDENTIAL;
+const identityAccessKey = process.env.AGENT_IDENTITY_ACCESS_KEY;
+const agentName = process.env.AGENT_NAME ?? 'Qwen Autonomous Trader';
+if (!agentCredential && !identityAccessKey) throw new Error('Set AGENT_CREDENTIAL or AGENT_IDENTITY_ACCESS_KEY');
 if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
 
 const qwen = new OpenAI({
@@ -34,14 +36,40 @@ const tools = [
   } },
 ];
 
+async function connectAgent(): Promise<void> {
+  if (!identityAccessKey) throw new Error('Cannot renew AgentHub2 credential without AGENT_IDENTITY_ACCESS_KEY');
+  const response = await fetch(`${baseUrl}/api/agent/connect`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ identity_access_key: identityAccessKey, agent_name: agentName }),
+  });
+  const data: any = await response.json().catch(() => ({}));
+  if (!response.ok || typeof data.connection_token !== 'string') throw new Error(`AgentHub2 connect failed (${response.status}): ${JSON.stringify(data)}`);
+  agentCredential = data.connection_token;
+  log(`AgentHub2 credential connected; expires ${new Date(Number(data.expires_at)).toISOString()}.`);
+}
+
 async function agenthub(path: string, init: RequestInit = {}): Promise<unknown> {
+  if (!agentCredential) await connectAgent();
   const response = await fetch(`${baseUrl}${path}`, {
     ...init,
-    headers: { authorization: `Bearer ${credential}`, 'content-type': 'application/json', ...(init.headers ?? {}) },
+    headers: { authorization: `Bearer ${agentCredential}`, 'content-type': 'application/json', ...(init.headers ?? {}) },
   });
   const text = await response.text();
   let body: unknown;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (response.status === 401 && identityAccessKey) {
+    await connectAgent();
+    const retry = await fetch(`${baseUrl}${path}`, {
+      ...init,
+      headers: { authorization: `Bearer ${agentCredential}`, 'content-type': 'application/json', ...(init.headers ?? {}) },
+    });
+    const retryText = await retry.text();
+    let retryBody: unknown;
+    try { retryBody = retryText ? JSON.parse(retryText) : null; } catch { retryBody = retryText; }
+    if (!retry.ok) throw new Error(`AgentHub2 ${retry.status}: ${typeof retryBody === 'string' ? retryBody : JSON.stringify(retryBody)}`);
+    return retryBody;
+  }
   if (!response.ok) throw new Error(`AgentHub2 ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
   return body;
 }
@@ -129,13 +157,19 @@ async function main() {
     log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.');
   });
 
+  if (!agentCredential && identityAccessKey) await connectAgent();
   await cycle();
+
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
-  if (!(interval > 0)) return;
-  setInterval(() => {
+  if (interval > 0) setInterval(() => {
     if (!status.enabled || status.running) return;
     cycle().catch(() => undefined);
   }, interval);
+
+  if (identityAccessKey) {
+    const refreshMs = Number(process.env.AGENT_CREDENTIAL_REFRESH_MS ?? 12 * 60 * 60 * 1000);
+    if (refreshMs > 0) setInterval(() => connectAgent().catch((error) => log(`Credential refresh failed: ${error instanceof Error ? error.message : String(error)}`)), refreshMs);
+  }
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
