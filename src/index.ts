@@ -17,8 +17,10 @@ const qwen = new OpenAI({
 });
 
 const tools = [
-  { type: 'function' as const, function: { name: 'get_markets', description: 'Get the live Perpl market context: markets, prices, funding and trading configuration.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'get_state', description: 'Get fresh direct-authenticated Perpl wallet/account state including balance, open orders, positions, forwarding status and head block.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_markets', description: 'Get the live Perpl market context from Perpl itself: markets, prices, funding and trading configuration. Treat this as the primary venue data source.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_state', description: 'Get a FRESH authenticated Perpl wallet/account state. This reconnects to Perpl before reading state so balance, account, open orders and positions reflect the latest exchange state, not a stale snapshot.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_market_candles', description: 'Get native Perpl OHLCV candles directly from the Perpl REST market-data endpoint. Use market_id from get_markets. Resolution is seconds: 60=1m, 300=5m, 900=15m, 1800=30m, 3600=1h, 7200=2h, 14400=4h, 28800=8h, 43200=12h, 86400=1d. Maximum 1024 candles per request.', parameters: { type: 'object', properties: { market_id: { type: 'integer', minimum: 1 }, resolution_seconds: { type: 'integer', enum: [60, 300, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400] }, from_ms: { type: 'integer', minimum: 0 }, to_ms: { type: 'integer', minimum: 0 } }, required: ['market_id', 'resolution_seconds', 'from_ms', 'to_ms'], additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_funding', description: 'Get native Perpl funding history directly from Perpl for one market. Use this for funding regime analysis instead of relying only on third-party data.', parameters: { type: 'object', properties: { market_id: { type: 'integer', minimum: 1 }, from_ms: { type: 'integer', minimum: 0 }, to_ms: { type: 'integer', minimum: 0 } }, required: ['market_id', 'from_ms', 'to_ms'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'get_trading_memory', description: 'Read the agent journal from previous cycles. Use it to learn from prior decisions, research summaries and execution outcomes.', parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 50 } }, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'web_research', description: 'Search the live web for recent news and analysis relevant to a trading hypothesis. Prefer several independent sources and use this before making a market-moving decision.', parameters: { type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'integer', minimum: 1, maximum: 10 } }, required: ['query'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'place_order', description: 'Place a directly authenticated Perpl order. Use exact market id and Perpl order parameters returned by get_markets/get_state. Size and price are Perpl scaled integers, leverage is hundredths (1000 = 10x).', parameters: { type: 'object', properties: { mkt: { type: 'integer' }, t: { type: 'integer' }, s: { type: 'number' }, lv: { type: 'number' }, fl: { type: 'integer' }, p: { type: 'number' }, a: { type: 'string' }, ms: { type: 'integer' }, tif: { type: 'integer' }, tp: { type: 'number' }, tpc: { type: 'number' }, tr: { type: 'number' }, lp: { type: 'number' }, bf: { type: 'number' } }, required: ['mkt', 't', 's', 'lv', 'fl'], additionalProperties: false } } },
@@ -37,6 +39,8 @@ function log(message: string) {
 async function runTool(name: string, args: Json): Promise<unknown> {
   if (name === 'get_markets') return perpl.getMarkets();
   if (name === 'get_state') return perpl.getState();
+  if (name === 'get_market_candles') return perpl.getMarketCandles(Number(args.market_id), Number(args.resolution_seconds), Number(args.from_ms), Number(args.to_ms));
+  if (name === 'get_funding') return perpl.getFunding(Number(args.market_id), Number(args.from_ms), Number(args.to_ms));
   if (name === 'get_trading_memory') return loadTradingMemory(Number(args.limit ?? 20));
   if (name === 'web_research') return webResearch(String(args.query ?? ''), Number(args.max_results ?? 6));
   if (name === 'place_order') return perpl.placeOrder(args as any);
@@ -57,12 +61,15 @@ export async function cycle() {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(20);
       const system = `You are an autonomous Perpl trading agent with DIRECT access to the Perpl API.
+Perpl is the execution venue and the primary source of truth for venue state and market data. Do not substitute generic web data for Perpl-native account, market, candle, or funding data when a Perpl tool can provide it.
 Qwen is the reasoning layer and Perpl is the execution venue. There is no AgentHub execution path.
 Your Perpl API key is server-side and the trading client signs requests with its Ed25519 private key. Never ask for, print, or expose credentials.
 Use the user strategy as the governing instruction set.
-Use a forecasting-first workflow inspired by FutureBench: gather current evidence from the web, form explicit probability-weighted hypotheses with a time horizon, identify disconfirming evidence, then decide whether the evidence justifies an action.
+Use a forecasting-first workflow inspired by FutureBench: gather current evidence from Perpl plus the live web, form explicit probability-weighted hypotheses with a time horizon, identify disconfirming evidence, then decide whether the evidence justifies an action.
 Do not treat web articles, prediction markets, or model opinions as facts. Prefer primary/first-party sources when possible and seek independent corroboration.
-Before trading, inspect fresh market configuration and authenticated account state. Confirm the account exists, has funds, is not frozen, and has API forwarding enabled before sending an order.
+Before trading, ALWAYS call get_state and use its fresh balance/available_balance/accounts/positions/orders values. Never carry forward an old balance from memory or a previous cycle.
+Use get_market_candles for native Perpl price history and get_funding for native Perpl funding history when relevant to the forecast.
+Confirm the account exists, has current funds, is not frozen, and has API forwarding enabled before sending an order.
 Use prior journal entries to identify repeated mistakes or successful patterns, but do not blindly copy prior actions.
 You may buy, sell, cancel, or do nothing. Only use exact Perpl order fields supported by the tools.
 Do not claim success unless a tool returned success.
@@ -70,7 +77,7 @@ Do not claim success unless a tool returned success.
 USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify(memory)}`;
       const messages: any[] = [
         { role: 'system', content: system },
-        { role: 'user', content: 'Run one autonomous trading cycle. Research what matters, inspect markets/account state, form explicit forecasts, compare against prior experience, then take an action only when the strategy and evidence support it. Finish with a concise explanation including the key forecast and confidence.' },
+        { role: 'user', content: 'Run one autonomous trading cycle. Research what matters, refresh Perpl account state, inspect native Perpl market/candle/funding data, form explicit forecasts, compare against prior experience, then take an action only when the strategy and evidence support it. Finish with a concise explanation including the key forecast, current account balance, and confidence.' },
       ];
       const maxSteps = Number(process.env.MAX_TOOL_STEPS ?? 10);
       let finalResult = 'No final response.';
