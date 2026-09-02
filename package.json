@@ -1,0 +1,19 @@
+{
+  "name": "qwen-autonomous-trader",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "ccxt": "^4.5.8",
+    "dotenv": "^17.2.1",
+    "openai": "^5.19.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
