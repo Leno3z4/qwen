@@ -7,10 +7,11 @@ import { startDashboard, type AgentStatus } from './server.js';
 type Json = Record<string, unknown>;
 
 const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2-gray.vercel.app').replace(/\/$/, '');
-let agentCredential = process.env.AGENT_CREDENTIAL;
-const identityAccessKey = process.env.AGENT_IDENTITY_ACCESS_KEY;
+const agentAccessKey = process.env.AGENTHUB_ACCESS_KEY;
+let connectionToken: string | null = null;
+let connectionExpiresAt = 0;
 const agentName = process.env.AGENT_NAME ?? 'Qwen Autonomous Trader';
-if (!agentCredential && !identityAccessKey) throw new Error('Set AGENT_CREDENTIAL or AGENT_IDENTITY_ACCESS_KEY');
+if (!agentAccessKey) throw new Error('Missing AGENTHUB_ACCESS_KEY');
 if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
 
 const qwen = new OpenAI({
@@ -27,7 +28,7 @@ const tools = [
   { type: 'function' as const, function: { name: 'cancel_order', description: 'Cancel an existing Perpl order through AgentHub2.', parameters: { type: 'object', properties: { mkt: { type: 'integer' }, oid: { type: 'integer' }, lb: { type: 'integer' } }, required: ['mkt', 'oid', 'lb'], additionalProperties: false } } },
 ];
 
-const status: AgentStatus = { running: false, enabled: process.env.AUTONOMOUS_ENABLED !== 'false', lastRunAt: null, lastResult: null, lastError: null, logs: [] };
+const status: AgentStatus = { running: false, enabled: process.env.AUTONOMOUS_ENABLED === 'true', lastRunAt: null, lastResult: null, lastError: null, logs: [] };
 
 function log(message: string) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -37,19 +38,42 @@ function log(message: string) {
 }
 
 async function connectAgent(): Promise<void> {
-  if (!identityAccessKey) throw new Error('Cannot renew AgentHub2 credential without AGENT_IDENTITY_ACCESS_KEY');
-  const response = await fetch(`${baseUrl}/api/agent/connect`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ identity_access_key: identityAccessKey, agent_name: agentName }) });
+  const response = await fetch(`${baseUrl}/api/agent/connect`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ identity_access_key: agentAccessKey, agent_name: agentName }),
+  });
   const data: any = await response.json().catch(() => ({}));
-  if (!response.ok || typeof data.connection_token !== 'string') throw new Error(`AgentHub2 connect failed (${response.status}): ${JSON.stringify(data)}`);
-  agentCredential = data.connection_token;
-  log(`AgentHub2 credential connected; expires ${new Date(Number(data.expires_at)).toISOString()}.`);
+  if (!response.ok || typeof data.connection_token !== 'string') {
+    throw new Error(`AgentHub2 connect failed (${response.status}): ${JSON.stringify(data)}`);
+  }
+  connectionToken = data.connection_token;
+  connectionExpiresAt = Number(data.expires_at ?? 0);
+  log(`AgentHub2 connection token refreshed; expires ${connectionExpiresAt ? new Date(connectionExpiresAt).toISOString() : 'unknown'}.`);
+}
+
+async function ensureConnectionToken(): Promise<void> {
+  const refreshSkewMs = 60_000;
+  if (!connectionToken || (connectionExpiresAt > 0 && Date.now() + refreshSkewMs >= connectionExpiresAt)) {
+    await connectAgent();
+  }
 }
 
 async function agenthub(path: string, init: RequestInit = {}): Promise<unknown> {
-  if (!agentCredential) await connectAgent();
-  const request = async () => fetch(`${baseUrl}${path}`, { ...init, headers: { authorization: `Bearer ${agentCredential}`, 'content-type': 'application/json', ...(init.headers ?? {}) } });
+  await ensureConnectionToken();
+  const request = async () => fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${connectionToken}`,
+      'content-type': 'application/json',
+      ...(init.headers ?? {}),
+    },
+  });
   let response = await request();
-  if (response.status === 401 && identityAccessKey) { await connectAgent(); response = await request(); }
+  if (response.status === 401) {
+    await connectAgent();
+    response = await request();
+  }
   const text = await response.text();
   let body: unknown;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -127,14 +151,10 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
 
 async function main() {
   startDashboard(cycle, () => ({ ...status, logs: [...status.logs] }), (enabled) => { status.enabled = enabled; log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.'); });
-  if (!agentCredential && identityAccessKey) await connectAgent();
+  await connectAgent();
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
-  if (identityAccessKey) {
-    const refreshMs = Number(process.env.AGENT_CREDENTIAL_REFRESH_MS ?? 12 * 60 * 60 * 1000);
-    if (refreshMs > 0) setInterval(() => connectAgent().catch((error) => log(`Credential refresh failed: ${error instanceof Error ? error.message : String(error)}`)), refreshMs);
-  }
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
