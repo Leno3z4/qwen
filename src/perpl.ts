@@ -183,8 +183,9 @@ export class PerplClient {
 
   private async connect(forceRefresh = false) {
     if (forceRefresh && this.ws?.readyState === WebSocket.OPEN) {
-      try { this.ws.close(); } catch {}
-      this.ws = undefined;
+      const oldWs = this.ws;
+      try { oldWs.close(); } catch {}
+      if (this.ws === oldWs) this.ws = undefined;
       this.state = { walletAddress: null, accounts: [], account: null, orders: [], positions: [], headBlock: null, sequence: null, updatedAt: 0 };
       this.buffer = [];
     }
@@ -219,7 +220,7 @@ export class PerplClient {
         if (Number(message.mt) === 19 && !settled) { settled = true; clearTimeout(timeout); resolve(); }
       });
       ws.once('error', (error) => { if (!settled) { settled = true; clearTimeout(timeout); reject(error); } });
-      ws.once('close', () => { this.ws = undefined; if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); } });
+      ws.once('close', () => { if (this.ws === ws) this.ws = undefined; if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); } });
     });
   }
 
