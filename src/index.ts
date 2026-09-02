@@ -27,7 +27,13 @@ const tools = [
   { type: 'function' as const, function: { name: 'cancel_order', description: 'Cancel an existing Perpl order directly over the authenticated trading WebSocket.', parameters: { type: 'object', properties: { mkt: { type: 'integer' }, oid: { type: 'integer' } }, required: ['mkt', 'oid'], additionalProperties: false } } },
 ];
 
-const status: AgentStatus = { running: false, enabled: process.env.AUTONOMOUS_ENABLED === 'true', lastRunAt: null, lastResult: null, lastError: null, logs: [] };
+const autonomousEnabled = process.env.AUTONOMOUS_ENABLED === 'true';
+const tradingEnabled = process.env.TRADING_ENABLED !== 'false';
+const allowLong = process.env.ALLOW_LONG !== 'false';
+const allowShort = process.env.ALLOW_SHORT !== 'false';
+const maxLeverage = Math.max(0.01, Number(process.env.MAX_LEVERAGE ?? 2));
+
+const status: AgentStatus = { running: false, enabled: autonomousEnabled, lastRunAt: null, lastResult: null, lastError: null, logs: [] };
 
 function log(message: string) {
   const line = `[${new Date().toISOString()}] ${message}`;
@@ -43,7 +49,13 @@ async function runTool(name: string, args: Json): Promise<unknown> {
   if (name === 'get_funding') return perpl.getFunding(Number(args.market_id), Number(args.from_ms), Number(args.to_ms));
   if (name === 'get_trading_memory') return loadTradingMemory(Number(args.limit ?? 20));
   if (name === 'web_research') return webResearch(String(args.query ?? ''), Number(args.max_results ?? 6));
-  if (name === 'place_order') return perpl.placeOrder(args as any);
+  if (name === 'place_order') {
+    if (!tradingEnabled) throw new Error('Trading is disabled by TRADING_ENABLED=false');
+    const leverageHundredths = Number(args.lv ?? 0);
+    if (!Number.isFinite(leverageHundredths) || leverageHundredths <= 0) throw new Error('Invalid leverage');
+    if (leverageHundredths > maxLeverage * 100) throw new Error(`Requested leverage exceeds MAX_LEVERAGE=${maxLeverage}`);
+    return perpl.placeOrder(args as any);
+  }
   if (name === 'cancel_order') return perpl.cancelOrder(Number(args.mkt), Number(args.oid));
   throw new Error(`Unknown tool: ${name}`);
 }
@@ -71,8 +83,9 @@ Before trading, ALWAYS call get_state and use its fresh balance/available_balanc
 Use get_market_candles for native Perpl price history and get_funding for native Perpl funding history when relevant to the forecast.
 Confirm the account exists, has current funds, is not frozen, and has API forwarding enabled before sending an order.
 Use prior journal entries to identify repeated mistakes or successful patterns, but do not blindly copy prior actions.
-You may buy, sell, cancel, or do nothing. Only use exact Perpl order fields supported by the tools.
-Do not claim success unless a tool returned success.
+You may buy, sell, cancel, or do nothing. Long entries are ${allowLong ? 'allowed' : 'disabled'}; short entries are ${allowShort ? 'allowed' : 'disabled'}; maximum leverage is ${maxLeverage}x. Trading execution is ${tradingEnabled ? 'enabled' : 'disabled'}.
+Do not force a trade when the evidence does not support one. When evidence is sufficient, choose the best supported long or short setup and execute it rather than defaulting to do nothing.
+Only use exact Perpl order fields supported by the tools. Do not claim success unless a tool returned success.
 
 USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify(memory)}`;
       const messages: any[] = [
@@ -113,7 +126,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
 
 async function main() {
   startDashboard(cycle, () => ({ ...status, logs: [...status.logs] }), (enabled) => { status.enabled = enabled; log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.'); });
-  log('Direct Perpl trading client configured. AgentHub2 is not used for execution.');
+  log(`Direct Perpl trading client configured. AgentHub2 is not used for execution. trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
