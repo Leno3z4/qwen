@@ -1,6 +1,6 @@
 {
   "name": "qwen-autonomous-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,10 +9,12 @@
   },
   "dependencies": {
     "dotenv": "^17.2.1",
-    "openai": "^5.19.1"
+    "openai": "^5.19.1",
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "tsx": "^4.20.5",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "@types/pg": "^8.15.5"
   }
 }
