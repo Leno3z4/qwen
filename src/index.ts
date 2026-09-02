@@ -7,6 +7,8 @@ import { perpl } from './perpl.js';
 
 type Json = Record<string, unknown>;
 
+type ModelConfig = { provider: string; apiKey: string; baseUrl: string; model: string };
+
 if (!process.env.PERPL_API_KEY) throw new Error('Missing PERPL_API_KEY');
 if (!process.env.PERPL_API_PRIVATE_KEY && !process.env.PERPL_API_KEY_SECRET) throw new Error('Missing PERPL_API_PRIVATE_KEY');
 
@@ -16,7 +18,40 @@ const modelBaseUrl = process.env.MODEL_BASE_URL ?? (modelProvider === 'groq' ? '
 const modelName = process.env.MODEL_NAME ?? (modelProvider === 'groq' ? 'openai/gpt-oss-120b' : process.env.QWEN_MODEL ?? 'qwen/qwen3-235b-a22b-2507:free');
 if (!modelApiKey) throw new Error(modelProvider === 'groq' ? 'Missing GROQ_API_KEY' : 'Missing MODEL_API_KEY/QWEN_API_KEY');
 
-const qwen = new OpenAI({ apiKey: modelApiKey, baseURL: modelBaseUrl });
+const primaryModel: ModelConfig = { provider: modelProvider, apiKey: modelApiKey, baseUrl: modelBaseUrl, model: modelName };
+const fallbackEnabled = process.env.FALLBACK_ENABLED !== 'false';
+const fallbackProvider = (process.env.FALLBACK_PROVIDER ?? 'gemini').trim().toLowerCase();
+const fallbackApiKey = fallbackProvider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.FALLBACK_API_KEY;
+const fallbackBaseUrl = process.env.FALLBACK_BASE_URL ?? (fallbackProvider === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta/openai/' : '');
+const fallbackModel = process.env.FALLBACK_MODEL ?? (fallbackProvider === 'gemini' ? 'gemini-2.5-flash' : '');
+const fallbackModelConfig: ModelConfig | null = fallbackEnabled && fallbackApiKey && fallbackModel && fallbackBaseUrl
+  ? { provider: fallbackProvider, apiKey: fallbackApiKey, baseUrl: fallbackBaseUrl, model: fallbackModel }
+  : null;
+
+function createClient(config: ModelConfig) {
+  return new OpenAI({ apiKey: config.apiKey, baseURL: config.baseUrl });
+}
+
+const primaryClient = createClient(primaryModel);
+const fallbackClient = fallbackModelConfig ? createClient(fallbackModelConfig) : null;
+
+function shouldFallback(error: unknown): boolean {
+  if (!fallbackModelConfig || !fallbackClient) return false;
+  const value = error as { status?: number; code?: string; message?: string };
+  if (value?.status === 429 || value?.status === 408 || (typeof value?.status === 'number' && value.status >= 500)) return true;
+  if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(value?.code ?? ''))) return true;
+  return /timeout|timed out|temporarily unavailable|connection reset|fetch failed/i.test(String(value?.message ?? error));
+}
+
+async function createCompletion(messages: any[], tools: any[]) {
+  try {
+    return await primaryClient.chat.completions.create({ model: primaryModel.model, messages, tools, tool_choice: 'auto' });
+  } catch (error) {
+    if (!shouldFallback(error)) throw error;
+    console.warn(`[model] ${primaryModel.provider}/${primaryModel.model} unavailable; falling back to ${fallbackModelConfig!.provider}/${fallbackModelConfig!.model}`);
+    return await fallbackClient!.chat.completions.create({ model: fallbackModelConfig!.model, messages, tools, tool_choice: 'auto' });
+  }
+}
 
 const tools = [
   { type: 'function' as const, function: { name: 'get_markets', description: 'Get the live Perpl market context from Perpl itself: markets, prices, funding and trading configuration. Treat this as the primary venue data source.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
@@ -74,7 +109,8 @@ export async function cycle() {
     try {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(20);
-      const system = `You are an autonomous Perpl trading agent using the ${modelProvider} model provider with DIRECT access to the Perpl API.
+      const fallbackDescription = fallbackModelConfig ? ` Primary=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModelConfig.provider}/${fallbackModelConfig.model}.` : ` Primary=${primaryModel.provider}/${primaryModel.model}; no fallback configured.`;
+      const system = `You are an autonomous Perpl trading agent using the configured model provider.${fallbackDescription}
 Perpl is the execution venue and the primary source of truth for venue state and market data. Do not substitute generic web data for Perpl-native account, market, candle, or funding data when a Perpl tool can provide it.
 There is no AgentHub execution path.
 Your Perpl API key is server-side and the trading client signs requests with its Ed25519 private key. Never ask for, print, or expose credentials.
@@ -97,7 +133,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
       const maxSteps = Number(process.env.MAX_TOOL_STEPS ?? 10);
       let finalResult = 'No final response.';
       for (let step = 0; step < maxSteps; step++) {
-        const response = await qwen.chat.completions.create({ model: modelName, messages, tools, tool_choice: 'auto' });
+        const response = await createCompletion(messages, tools);
         const message: any = response.choices[0]?.message;
         if (!message) throw new Error('Model returned no message');
         messages.push(message);
@@ -128,7 +164,7 @@ USER-PROVIDED STRATEGY:\n${strategy}\n\nRECENT TRADING MEMORY:\n${JSON.stringify
 
 async function main() {
   startDashboard(cycle, () => ({ ...status, logs: [...status.logs] }), (enabled) => { status.enabled = enabled; log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.'); });
-  log(`Direct Perpl trading client configured. provider=${modelProvider} model=${modelName} trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
+  log(`Direct Perpl trading client configured. primary=${primaryModel.provider}/${primaryModel.model} fallback=${fallbackModelConfig ? `${fallbackModelConfig.provider}/${fallbackModelConfig.model}` : 'disabled'} trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
