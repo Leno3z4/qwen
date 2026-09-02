@@ -1,128 +1,147 @@
 import 'dotenv/config';
 import OpenAI from 'openai';
-import ccxt from 'ccxt';
 
-type Decision = { action: 'buy' | 'sell' | 'hold'; amount?: number; reason: string };
+type Json = Record<string, unknown>;
 
-const symbol = process.env.TRADING_SYMBOL ?? 'BTC/USDT';
-const timeframe = process.env.TIMEFRAME ?? '5m';
-const paper = (process.env.PAPER_TRADING ?? 'true').toLowerCase() !== 'false';
-
+const baseUrl = (process.env.AGENTHUB_URL ?? 'https://agenthub2-gray.vercel.app').replace(/\/$/, '');
+const credential = process.env.AGENT_CREDENTIAL;
+if (!credential) throw new Error('Missing AGENT_CREDENTIAL');
 if (!process.env.QWEN_API_KEY) throw new Error('Missing QWEN_API_KEY');
 
 const qwen = new OpenAI({
   apiKey: process.env.QWEN_API_KEY,
-  baseURL: process.env.QWEN_BASE_URL ?? 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'
+  baseURL: process.env.QWEN_BASE_URL ?? 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
 });
 
-const exchangeId = process.env.EXCHANGE ?? 'binance';
-const Exchange = (ccxt as any)[exchangeId];
-if (!Exchange) throw new Error(`Unsupported CCXT exchange: ${exchangeId}`);
-
-const exchange = new Exchange({
-  apiKey: process.env.EXCHANGE_API_KEY,
-  secret: process.env.EXCHANGE_API_SECRET,
-  password: process.env.EXCHANGE_API_PASSWORD,
-  enableRateLimit: true,
-  options: { defaultType: process.env.EXCHANGE_MARKET_TYPE ?? 'spot' }
-});
-
-async function marketData() {
-  const ticker = await exchange.fetchTicker(symbol);
-  const candles = await exchange.fetchOHLCV(symbol, timeframe, undefined, 50);
-  return {
-    symbol,
-    timeframe,
-    last: ticker.last,
-    bid: ticker.bid,
-    ask: ticker.ask,
-    change24h: ticker.percentage,
-    candles: candles.map(([time, open, high, low, close, volume]) => ({ time, open, high, low, close, volume }))
-  };
+async function agenthub(path: string, init: RequestInit = {}): Promise<unknown> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...init,
+    headers: {
+      authorization: `Bearer ${credential}`,
+      'content-type': 'application/json',
+      ...(init.headers ?? {}),
+    },
+  });
+  const text = await response.text();
+  let body: unknown;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!response.ok) throw new Error(`AgentHub2 ${response.status}: ${typeof body === 'string' ? body : JSON.stringify(body)}`);
+  return body;
 }
 
-async function accountState() {
-  if (paper) return { mode: 'paper', balance: 'virtual', positions: [] };
-  return await exchange.fetchBalance();
-}
-
-async function executeOrder(side: 'buy' | 'sell', amount: number) {
-  if (paper) return { mode: 'paper', symbol, side, amount, status: 'simulated' };
-  return await exchange.createMarketOrder(symbol, side, amount);
-}
-
-const tools: any[] = [
+const tools = [
   {
-    type: 'function',
+    type: 'function' as const,
     function: {
-      name: 'get_market_data',
-      description: 'Get recent OHLCV candles and current ticker data for the configured market.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false }
-    }
+      name: 'get_markets',
+      description: 'Get the currently available Perpl markets and their configuration.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
   },
   {
-    type: 'function',
+    type: 'function' as const,
     function: {
-      name: 'get_account_state',
-      description: 'Get the current account balance and positions. Paper mode returns a simulated state.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false }
-    }
+      name: 'get_state',
+      description: 'Get fresh authenticated Perpl account state including balance, open orders, positions and head block.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+    },
   },
   {
-    type: 'function',
+    type: 'function' as const,
     function: {
-      name: 'execute_order',
-      description: 'Execute a market order. The application enforces paper/live mode outside the model.',
+      name: 'place_order',
+      description: 'Place an authenticated Perpl order through AgentHub2. Use the exact market id and Perpl order parameters returned by market/state tools.',
       parameters: {
         type: 'object',
-        properties: { side: { type: 'string', enum: ['buy', 'sell'] }, amount: { type: 'number' } },
-        required: ['side', 'amount'],
-        additionalProperties: false
-      }
-    }
-  }
+        properties: {
+          mkt: { type: 'integer', description: 'Perpl market id' },
+          t: { type: 'integer', description: 'Perpl order type' },
+          s: { type: 'number', description: 'Order size' },
+          lv: { type: 'number', description: 'Leverage' },
+          fl: { type: 'integer', description: 'Perpl order flags' },
+          p: { type: 'number', description: 'Limit price when required' },
+          a: { type: 'string', description: 'Optional auxiliary order field' },
+          ms: { type: 'integer', description: 'Market slippage when required' },
+          tif: { type: 'integer', description: 'Time-in-force when required' },
+          tp: { type: 'number' },
+          tpc: { type: 'number' },
+          tr: { type: 'number' },
+          lp: { type: 'number' },
+          bf: { type: 'number' },
+        },
+        required: ['mkt', 't', 's', 'lv', 'fl'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'cancel_order',
+      description: 'Cancel an existing Perpl order through AgentHub2.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mkt: { type: 'integer' },
+          oid: { type: 'integer' },
+          lb: { type: 'integer', description: 'Fresh Perpl head block / last execution block from state' },
+        },
+        required: ['mkt', 'oid', 'lb'],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
-const system = `You are an autonomous market-analysis agent. You operate only through the supplied tools. Analyze the configured market using fresh tool data. Make one clear decision: buy, sell, or hold. Never invent market/account data. Keep reasoning concise. The execution layer, not you, controls paper/live mode.`;
+async function runTool(name: string, args: Json): Promise<unknown> {
+  if (name === 'get_markets') return agenthub('/api/agent/perpl/markets');
+  if (name === 'get_state') return agenthub('/api/agent/perpl/state');
+  if (name === 'place_order') return agenthub('/api/agent/perpl/order', { method: 'POST', body: JSON.stringify(args) });
+  if (name === 'cancel_order') return agenthub('/api/agent/perpl/order/cancel', { method: 'POST', body: JSON.stringify(args) });
+  throw new Error(`Unknown tool: ${name}`);
+}
 
-async function runAgent() {
-  const messages: any[] = [
-    { role: 'system', content: system },
-    { role: 'user', content: `Analyze ${symbol} on ${timeframe}. Obtain current market and account data, then decide whether to buy, sell, or hold. If trading, choose an amount that is explicitly supported by the available account state.` }
-  ];
+const system = `You are an autonomous Perpl trading agent operating through AgentHub2.
+You have authenticated read and trade tools. AgentHub2 is the execution and authorization layer; never bypass it and never invent exchange/account data.
+Before making a trading decision, inspect fresh market configuration and account state. Respect the market's actual parameters and the account's current positions/orders.
+You may decide to buy, sell, or do nothing. If you trade, use only the exact Perpl order fields supported by the execution tool.
+Do not claim an order succeeded unless the tool returned success. Keep each cycle concise and explain the action taken.`;
 
-  for (let step = 0; step < 8; step++) {
+async function cycle() {
+  const messages: any[] = [{ role: 'system', content: system }, { role: 'user', content: 'Run one autonomous trading cycle. Inspect markets and current account state, analyze the available information, and take an action only if your strategy calls for one.' }];
+  const maxSteps = Number(process.env.MAX_TOOL_STEPS ?? 10);
+
+  for (let step = 0; step < maxSteps; step++) {
     const response = await qwen.chat.completions.create({
       model: process.env.QWEN_MODEL ?? 'qwen3-max',
       messages,
       tools,
-      tool_choice: 'auto'
+      tool_choice: 'auto',
     });
-
     const message: any = response.choices[0].message;
     messages.push(message);
-
     if (!message.tool_calls?.length) {
-      console.log('\nAGENT:', message.content);
+      console.log(`[${new Date().toISOString()}] ${message.content ?? ''}`);
       return;
     }
-
     for (const call of message.tool_calls) {
-      const args = JSON.parse(call.function.arguments || '{}');
       let result: unknown;
-      if (call.function.name === 'get_market_data') result = await marketData();
-      else if (call.function.name === 'get_account_state') result = await accountState();
-      else if (call.function.name === 'execute_order') {
-        if (!Number.isFinite(args.amount) || args.amount <= 0) throw new Error('Invalid order amount');
-        result = await executeOrder(args.side, args.amount);
-      } else throw new Error(`Unknown tool: ${call.function.name}`);
+      try {
+        result = await runTool(call.function.name, JSON.parse(call.function.arguments || '{}'));
+      } catch (error) {
+        result = { error: error instanceof Error ? error.message : String(error) };
+      }
       messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
-  throw new Error('Agent exceeded tool-call limit');
+  throw new Error('Qwen exceeded MAX_TOOL_STEPS');
 }
 
-runAgent().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+async function main() {
+  await cycle();
+  const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
+  if (!(interval > 0)) return;
+  setInterval(() => cycle().catch((error) => console.error(`[${new Date().toISOString()}] cycle failed`, error)), interval);
+}
+
+main().catch((error) => { console.error(error); process.exitCode = 1; });
