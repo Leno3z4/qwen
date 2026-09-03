@@ -100,6 +100,7 @@ const html = `<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 let busy = false;
+let strategyDirty = false;
 function showToast(message){const t=$('toast');t.textContent=message;t.classList.add('show');clearTimeout(showToast.timer);showToast.timer=setTimeout(()=>t.classList.remove('show'),2200)}
 function showError(message){const b=$('banner');b.textContent=message;b.classList.add('show')}
 function clearError(){$('banner').classList.remove('show')}
@@ -113,10 +114,11 @@ function renderStatus(st){
   $('result').textContent=st.lastResult||''; if(!st.lastResult)$('result').innerHTML='<div class="empty">No cycle has completed yet.</div>'; $('resultTime').textContent=st.lastRunAt?new Date(st.lastRunAt).toLocaleTimeString():'—';
   const logs=st.logs||[]; $('logs').textContent=logs.length?logs.join('\\n\\n'):'No activity yet.';
 }
-async function refresh(){const [strategy,status]=await Promise.all([api('/api/strategy'),api('/api/status')]);$('strategy').value=strategy.strategy;renderStatus(status);clearError()}
+async function refresh(){const [strategy,status]=await Promise.all([api('/api/strategy'),api('/api/status')]);if(!strategyDirty && document.activeElement !== $('strategy')) $('strategy').value=strategy.strategy;renderStatus(status);clearError()}
+$('strategy').addEventListener('input',()=>{strategyDirty=true});
 $('refresh').onclick=async()=>{try{await refresh();showToast('Dashboard refreshed')}catch(e){showError(e.message)}};
-$('reload').onclick=async()=>{try{const d=await api('/api/strategy');$('strategy').value=d.strategy;showToast('Strategy reloaded')}catch(e){showError(e.message)}};
-$('save').onclick=async()=>{try{await api('/api/strategy',{method:'POST',body:JSON.stringify({strategy:$('strategy').value})});showToast('Strategy saved');await refresh()}catch(e){showError(e.message)}};
+$('reload').onclick=async()=>{try{const d=await api('/api/strategy');$('strategy').value=d.strategy;strategyDirty=false;showToast('Strategy reloaded')}catch(e){showError(e.message)}};
+$('save').onclick=async()=>{try{await api('/api/strategy',{method:'POST',body:JSON.stringify({strategy:$('strategy').value})});strategyDirty=false;showToast('Strategy saved');await refresh()}catch(e){showError(e.message)}};
 $('run').onclick=async()=>{try{busy=true;$('run').textContent='Running…';clearError();await api('/api/run',{method:'POST',body:'{}'});showToast('Cycle completed');await refresh()}catch(e){showError(e.message)}finally{busy=false;$('run').textContent='Run one cycle';await refresh().catch(()=>{})}};
 $('toggle').onclick=async()=>{try{const st=await api('/api/status');await api('/api/control',{method:'POST',body:JSON.stringify({enabled:!st.enabled})});showToast(!st.enabled?'Autonomous loop enabled':'Autonomous loop disabled');await refresh()}catch(e){showError(e.message)}};
 refresh().catch(e=>showError(e.message));setInterval(()=>refresh().catch(()=>{}),3000);
