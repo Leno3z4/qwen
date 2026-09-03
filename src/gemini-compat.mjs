@@ -1,3 +1,9 @@
+// Render/OpenRouter compatibility: agent.ts historically reads MODEL_API_KEY/QWEN_API_KEY.
+// Accept the native OPENROUTER_API_KEY name too without ever logging the secret.
+if (!process.env.MODEL_API_KEY && process.env.OPENROUTER_API_KEY) {
+  process.env.MODEL_API_KEY = process.env.OPENROUTER_API_KEY;
+}
+
 const originalFetch = globalThis.fetch.bind(globalThis);
 const GEMINI_OPENAI_PREFIX = 'https://generativelanguage.googleapis.com/v1beta/openai/';
 
