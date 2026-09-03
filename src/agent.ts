@@ -42,16 +42,44 @@ function isToolArgumentError(error: unknown): boolean {
 
 function isTransientModelError(error: unknown): boolean {
   const value = error as { status?: number; code?: string; message?: string };
-  if (value?.status === 408 || value?.status === 429 || (typeof value?.status === 'number' && value.status >= 500)) return true;
+  if (value?.status === 408 || value?.status === 413 || value?.status === 429 || (typeof value?.status === 'number' && value.status >= 500)) return true;
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(value?.code ?? ''))) return true;
-  return /timeout|temporarily unavailable|connection reset|fetch failed/i.test(String(value?.message ?? error));
+  return /timeout|temporarily unavailable|connection reset|request too large|context length|too many tokens|fetch failed/i.test(String(value?.message ?? error));
+}
+
+function compactText(value: unknown, maxChars: number): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 120))}\n...[truncated ${text.length - maxChars} chars]...`;
+}
+
+function compactMessages(messages: any[]): any[] {
+  const maxChars = 26000;
+  const first = messages.slice(0, 2).map((message) => ({
+    ...message,
+    content: message.content === undefined ? message.content : compactText(message.content, 9000),
+  }));
+  const recent = messages.slice(2);
+  const kept: any[] = [];
+  let chars = first.reduce((total, message) => total + JSON.stringify(message).length, 0);
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const message = recent[i];
+    const copy: any = { ...message };
+    if (copy.content !== undefined) copy.content = compactText(copy.content, 4500);
+    const serializedLength = JSON.stringify(copy).length;
+    if (chars + serializedLength > maxChars) break;
+    kept.unshift(copy);
+    chars += serializedLength;
+  }
+  return [...first, ...kept];
 }
 
 async function callProvider(config: ModelConfig, client: OpenAI, messages: any[], tools: any[], retryToolGeneration = false) {
   const groq = config.provider === 'groq';
+  const boundedMessages = compactMessages(messages);
   const request: any = {
     model: config.model,
-    messages,
+    messages: boundedMessages,
     tools,
     tool_choice: 'auto',
     parallel_tool_calls: false,
