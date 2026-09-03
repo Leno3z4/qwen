@@ -12,6 +12,17 @@ const MODEL_ENDPOINTS = [
   'https://api.groq.com/openai/v1/',
 ];
 
+const CAPITAL_POLICY = `
+
+ENGINE CAPITAL POLICY:
+- A small account balance is a sizing constraint, not an automatic NO TRADE reason.
+- Never invent an extra safety buffer above the venue's actual limits.
+- If live Perpl data shows the account balance is at or above the applicable venue minimum and a valid order can be sized within available funds, leverage, margin, and liquidation/risk limits, the agent may trade.
+- Use the smallest valid order size the venue accepts when capital is limited.
+- If one order size is rejected, adapt the size or reassess the market; do not declare the whole account untradeable solely because it is small.
+- Continue to obey real venue constraints, account state, long/short permissions, and MAX_LEVERAGE.
+`;
+
 function textContent(value) {
   if (typeof value === 'string') return value;
   if (value === undefined || value === null) return '';
@@ -162,6 +173,15 @@ function rewriteBody(rawBody, isGemini) {
   try { body = JSON.parse(rawBody); } catch { return null; }
 
   body.messages = normalizeMessages(body.messages, !isGemini);
+  if (Array.isArray(body.messages)) {
+    const systemIndex = body.messages.findIndex((message) => message?.role === 'system');
+    if (systemIndex >= 0) {
+      body.messages[systemIndex] = {
+        ...body.messages[systemIndex],
+        content: `${textContent(body.messages[systemIndex].content)}${CAPITAL_POLICY}`,
+      };
+    }
+  }
   body.tools = sanitizeTools(body.tools);
 
   if (isGemini) {
