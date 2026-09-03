@@ -4,15 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx src/agent.ts",
-    "start": "tsx src/agent.ts"
+    "dev": "tsx --import ./src/gemini-compat.mjs src/agent.ts",
+    "start": "tsx --import ./src/gemini-compat.mjs src/agent.ts"
   },
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
     "dotenv": "^17.2.1",
     "openai": "^5.19.1",
     "pg": "^8.16.3",
-    "ws": "^8.18.0"
+    "ws": "^8.18.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
