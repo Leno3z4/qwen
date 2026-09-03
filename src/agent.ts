@@ -34,6 +34,10 @@ function clientFor(config: ModelConfig) {
 const primaryClient = clientFor(primaryModel);
 const fallbackClient = fallbackModel ? clientFor(fallbackModel) : null;
 let primaryCooldownUntil = 0;
+let fallbackCooldownUntil = 0;
+let fallbackCooldownReason = '';
+let cycleModelCalls = 0;
+let cycleFallbackCalls = 0;
 
 function isToolArgumentError(error: unknown): boolean {
   const value = error as { status?: number; message?: string; error?: { message?: string; failed_generation?: unknown } };
@@ -84,7 +88,7 @@ function compactMessages(messages: any[], maxChars: number): any[] {
   const recent = messages.slice(2);
   const kept: any[] = [];
   let chars = first.reduce((total, message) => total + JSON.stringify(message).length, 0);
-  const perMessage = Math.min(3200, Math.max(1200, Math.floor(maxChars * 0.22)));
+  const perMessage = Math.min(2800, Math.max(1000, Math.floor(maxChars * 0.22)));
   for (let i = recent.length - 1; i >= 0; i--) {
     const copy: any = { ...recent[i] };
     if (copy.content !== undefined) copy.content = compactText(copy.content, perMessage);
@@ -98,7 +102,7 @@ function compactMessages(messages: any[], maxChars: number): any[] {
 
 async function callProvider(config: ModelConfig, client: OpenAI, messages: any[], tools: any[], retryToolGeneration = false) {
   const groq = config.provider === 'groq';
-  const messageBudget = groq ? 14000 : 26000;
+  const messageBudget = groq ? 14000 : 14000;
   const boundedMessages = compactMessages(messages, messageBudget);
   const request: any = {
     model: config.model,
@@ -106,7 +110,7 @@ async function callProvider(config: ModelConfig, client: OpenAI, messages: any[]
     tools,
     tool_choice: 'auto',
     parallel_tool_calls: false,
-    max_completion_tokens: groq ? 1024 : 2048,
+    max_completion_tokens: groq ? 1024 : 1024,
   };
   if (groq) {
     request.temperature = retryToolGeneration ? 0 : 0.2;
@@ -118,27 +122,52 @@ async function callProvider(config: ModelConfig, client: OpenAI, messages: any[]
 
 async function callFallback(messages: any[], tools: any[]) {
   if (!fallbackModel || !fallbackClient) throw new Error('Fallback model is not configured');
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      return await callProvider(fallbackModel, fallbackClient, messages, tools);
-    } catch (error) {
-      lastError = error;
-      console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} attempt ${attempt + 1}/3 failed: ${errorSummary(error)}`);
-      if (!isTransientModelError(error)) throw error;
-      const retryDelay = parseRetryDelayMs(error);
-      if (retryDelay !== null && retryDelay > 10_000) throw error;
-      if (attempt < 2) await sleep(retryDelay ?? (1500 * (attempt + 1)));
-    }
+  if (Date.now() < fallbackCooldownUntil) {
+    const remaining = Math.ceil((fallbackCooldownUntil - Date.now()) / 1000);
+    throw new Error(`Fallback ${fallbackModel.provider}/${fallbackModel.model} is cooling down for ${remaining}s${fallbackCooldownReason ? ` (${fallbackCooldownReason})` : ''}`);
   }
-  throw lastError;
+  cycleFallbackCalls += 1;
+  try {
+    return await callProvider(fallbackModel, fallbackClient, messages, tools);
+  } catch (error) {
+    const statusCode = (error as { status?: number })?.status;
+    console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} failed: ${errorSummary(error)}`);
+    if (!isTransientModelError(error)) throw error;
+    const retryDelay = parseRetryDelayMs(error);
+    if (statusCode === 429) {
+      const cooldown = Math.min(Math.max(retryDelay ?? 10 * 60_000, 60_000), 60 * 60_000);
+      fallbackCooldownUntil = Date.now() + cooldown;
+      fallbackCooldownReason = 'rate limited; no retry storm';
+      console.warn(`[model] ${fallbackModel.provider}/${fallbackModel.model} rate-limited; cooling fallback for ${Math.ceil(cooldown / 1000)}s and ending this cycle`);
+      throw error;
+    }
+    if (retryDelay !== null && retryDelay > 10_000) throw error;
+    if (isTransientModelError(error) && cycleFallbackCalls < 2) {
+      const delay = retryDelay ?? 1500;
+      await sleep(Math.min(delay, 5000));
+      cycleFallbackCalls += 1;
+      try {
+        return await callProvider(fallbackModel, fallbackClient, messages, tools);
+      } catch (retryError) {
+        console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} retry failed: ${errorSummary(retryError)}`);
+        throw retryError;
+      }
+    }
+    throw error;
+  }
 }
 
 async function createCompletion(messages: any[], tools: any[]) {
+  if (cycleModelCalls >= 5) throw new Error('Cycle model-call budget exhausted; stopping to protect provider quotas');
   if (fallbackModel && fallbackClient && Date.now() < primaryCooldownUntil) {
+    if (Date.now() < fallbackCooldownUntil) {
+      throw new Error(`Primary and fallback are cooling down; stopping this cycle${fallbackCooldownReason ? ` (${fallbackCooldownReason})` : ''}`);
+    }
     console.warn(`[model] primary ${primaryModel.provider}/${primaryModel.model} is cooling down; using fallback without another primary request`);
+    cycleModelCalls += 1;
     return await callFallback(messages, tools);
   }
+  cycleModelCalls += 1;
   try {
     return await callProvider(primaryModel, primaryClient, messages, tools);
   } catch (error) {
@@ -146,6 +175,7 @@ async function createCompletion(messages: any[], tools: any[]) {
     if (primaryModel.provider === 'groq' && isToolArgumentError(error)) {
       console.warn('[model] Groq rejected a generated tool call; retrying with deterministic tool-call settings.');
       try {
+        cycleModelCalls += 1;
         return await callProvider(primaryModel, primaryClient, messages, tools, true);
       } catch (retryError) {
         console.warn(`[model] Groq deterministic retry failed: ${errorSummary(retryError)}`);
@@ -158,6 +188,11 @@ async function createCompletion(messages: any[], tools: any[]) {
     const cooldown = Math.min(Math.max(retryDelay ?? 120_000, 60_000), 20 * 60_000);
     primaryCooldownUntil = Date.now() + cooldown;
     console.warn(`[model] ${primaryModel.provider}/${primaryModel.model} unavailable; cooling primary for ${Math.ceil(cooldown / 1000)}s and falling back to ${fallbackModel.provider}/${fallbackModel.model}`);
+    if (Date.now() < fallbackCooldownUntil) {
+      throw new Error(`Primary ${primaryModel.provider}/${primaryModel.model} and fallback ${fallbackModel.provider}/${fallbackModel.model} are unavailable right now`);
+    }
+    if (cycleModelCalls >= 5) throw new Error('No model-call budget remains for fallback; stopping this cycle');
+    cycleModelCalls += 1;
     return await callFallback(messages, tools);
   }
 }
@@ -243,7 +278,7 @@ const tools = [
   { type: 'function' as const, function: { name: 'get_trading_memory', description: 'Read recent agent journal entries. Use it for lessons, not stale account state.', parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } }, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'web_research', description: 'Search recent web/news evidence relevant to a trading hypothesis.', parameters: { type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'integer', minimum: 1, maximum: 6 } }, required: ['query'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'place_order', description: 'Place a Perpl order. t=1 OpenLong, t=2 OpenShort, t=3 CloseLong, t=4 CloseShort. For close orders, set lp to the exact position id and s to the amount to close. Multiple orders can be placed in one cycle.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, t: { type: 'integer', enum: [1, 2, 3, 4] }, s: { type: 'number', minimum: 0 }, lv: { type: 'number', minimum: 0 }, fl: { type: 'integer', minimum: 0 }, p: { type: 'number' }, a: { type: 'string' }, ms: { type: 'integer' }, tif: { type: 'integer' }, tp: { type: 'number' }, tpc: { type: 'number' }, tr: { type: 'number' }, lp: { type: 'integer', minimum: 1 }, bf: { type: 'number' } }, required: ['mkt', 't', 's', 'lv', 'fl'], additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'manage_position', description: 'Reduce or fully close ONE existing Perpl position by exact position id. Use this for precise per-position management. Repeat for multiple positions in the same cycle when justified.', parameters: { type: 'object', properties: { position_id: { type: 'integer', minimum: 1 }, action: { type: 'string', enum: ['reduce', 'close'] }, size: { type: 'number', minimum: 0 } }, required: ['position_id', 'action'], additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'manage_position', description: 'Reduce or fully close ONE existing Perpl position by exact position id. Use this for precise reduction/closure. Repeat for multiple positions in the same cycle when justified.', parameters: { type: 'object', properties: { position_id: { type: 'integer', minimum: 1 }, action: { type: 'string', enum: ['reduce', 'close'] }, size: { type: 'number', minimum: 0 } }, required: ['position_id', 'action'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'cancel_order', description: 'Cancel an existing Perpl order.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, oid: { type: 'integer', minimum: 1 } }, required: ['mkt', 'oid'], additionalProperties: false } } },
 ];
 
@@ -326,6 +361,8 @@ export async function cycle() {
     status.running = true;
     status.lastRunAt = new Date().toISOString();
     status.lastError = null;
+    cycleModelCalls = 0;
+    cycleFallbackCalls = 0;
     const toolNames: string[] = [];
     try {
       const strategy = await loadStrategy();
@@ -359,7 +396,8 @@ USER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResul
         { role: 'system', content: system },
         { role: 'user', content: 'Run one autonomous portfolio cycle. First refresh Perpl state and review every current position/order. Compare multiple available markets rather than anchoring on HYPE. Manage existing positions first when needed, then consider new entries. You may take multiple justified actions in this cycle. Finish with the key forecast, portfolio state, actions taken, and confidence.' },
       ];
-      const maxSteps = Math.min(Math.max(Number(process.env.MAX_TOOL_STEPS ?? 8), 1), 8);
+      const configuredSteps = Number(process.env.MAX_TOOL_STEPS ?? 5);
+      const maxSteps = Math.min(Math.max(Number.isFinite(configuredSteps) ? configuredSteps : 5, 1), 5);
       let finalResult = 'No final response.';
       for (let step = 0; step < maxSteps; step++) {
         const response = await createCompletion(messages, tools);
