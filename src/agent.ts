@@ -121,13 +121,14 @@ function compactToolResult(name: string, result: unknown): unknown {
     if (Array.isArray(source.markets)) {
       return compactValue({
         ...source,
-        markets: source.markets.slice(0, 20).map((market: any) => ({
+        markets: source.markets.slice(0, 40).map((market: any) => ({
           id: market?.id,
           symbol: market?.symbol ?? market?.name,
           price: market?.price ?? market?.mark_price ?? market?.index_price,
           index_price: market?.index_price,
           mark_price: market?.mark_price,
           funding: market?.funding ?? market?.funding_rate,
+          open: market?.state?.is_open ?? market?.is_open,
           ...Object.fromEntries(Object.entries(market ?? {}).filter(([key]) => /leverage|tick|step|min|max|status|contract|order_ttl/i.test(key))),
         })),
       });
@@ -146,8 +147,8 @@ function compactToolResult(name: string, result: unknown): unknown {
         lfr: source.account.lfr,
       } : null,
       accounts: Array.isArray(source.accounts) ? source.accounts.slice(0, 8) : source.accounts,
-      orders: Array.isArray(source.orders) ? source.orders.slice(-20) : source.orders,
-      positions: Array.isArray(source.positions) ? source.positions.slice(-12) : source.positions,
+      orders: Array.isArray(source.orders) ? source.orders.slice(-30) : source.orders,
+      positions: Array.isArray(source.positions) ? source.positions.slice(-30) : source.positions,
     });
   }
   if (name === 'get_market_candles' && result && typeof result === 'object') {
@@ -182,13 +183,14 @@ function compactToolResult(name: string, result: unknown): unknown {
 }
 
 const tools = [
-  { type: 'function' as const, function: { name: 'get_markets', description: 'Get live Perpl market context. This is the primary venue market-data source.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'get_state', description: 'Get a fresh authenticated Perpl wallet/account state including balance, available balance, orders and positions.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_markets', description: 'Get live Perpl market context for the whole venue. Inspect multiple markets; do not default to HYPE.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_state', description: 'Get a fresh authenticated Perpl portfolio state including ALL current accounts, open orders, and ALL open positions. Use this before every trade decision.', parameters: { type: 'object', properties: {}, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'get_market_candles', description: 'Get native Perpl OHLCV candles. Use market_id from get_markets. Resolution seconds: 60, 300, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400.', parameters: { type: 'object', properties: { market_id: { type: 'integer', minimum: 1 }, resolution_seconds: { type: 'integer', enum: [60, 300, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400] }, from_ms: { type: 'integer', minimum: 0 }, to_ms: { type: 'integer', minimum: 0 } }, required: ['market_id', 'resolution_seconds', 'from_ms', 'to_ms'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'get_funding', description: 'Get native Perpl funding history for one market.', parameters: { type: 'object', properties: { market_id: { type: 'integer', minimum: 1 }, from_ms: { type: 'integer', minimum: 0 }, to_ms: { type: 'integer', minimum: 0 } }, required: ['market_id', 'from_ms', 'to_ms'], additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'get_trading_memory', description: 'Read recent agent journal entries.', parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } }, additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'get_trading_memory', description: 'Read recent agent journal entries. Use it for lessons, not stale account state.', parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } }, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'web_research', description: 'Search recent web/news evidence relevant to a trading hypothesis.', parameters: { type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'integer', minimum: 1, maximum: 6 } }, required: ['query'], additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'place_order', description: 'Place a directly authenticated Perpl order using exact fields supported by Perpl.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, t: { type: 'integer' }, s: { type: 'number' }, lv: { type: 'number' }, fl: { type: 'integer' }, p: { type: 'number' }, a: { type: 'string' }, ms: { type: 'integer' }, tif: { type: 'integer' }, tp: { type: 'number' }, tpc: { type: 'number' }, tr: { type: 'number' }, lp: { type: 'number' }, bf: { type: 'number' } }, required: ['mkt', 't', 's', 'lv', 'fl'], additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'place_order', description: 'Place a Perpl order. t=1 OpenLong, t=2 OpenShort, t=3 CloseLong, t=4 CloseShort. For close orders, set lp to the exact position id and s to the amount to close. Multiple orders can be placed in one cycle.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, t: { type: 'integer', enum: [1, 2, 3, 4] }, s: { type: 'number', minimum: 0 }, lv: { type: 'number', minimum: 0 }, fl: { type: 'integer', minimum: 0 }, p: { type: 'number' }, a: { type: 'string' }, ms: { type: 'integer' }, tif: { type: 'integer' }, tp: { type: 'number' }, tpc: { type: 'number' }, tr: { type: 'number' }, lp: { type: 'integer', minimum: 1 }, bf: { type: 'number' } }, required: ['mkt', 't', 's', 'lv', 'fl'], additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'manage_position', description: 'Reduce or fully close ONE existing Perpl position by exact position id. Use this for precise per-position management. Repeat for multiple positions in the same cycle when justified.', parameters: { type: 'object', properties: { position_id: { type: 'integer', minimum: 1 }, action: { type: 'string', enum: ['reduce', 'close'] }, size: { type: 'number', minimum: 0 } }, required: ['position_id', 'action'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'cancel_order', description: 'Cancel an existing Perpl order.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, oid: { type: 'integer', minimum: 1 } }, required: ['mkt', 'oid'], additionalProperties: false } } },
 ];
 
@@ -217,10 +219,47 @@ async function runTool(name: string, args: Json): Promise<unknown> {
   else if (name === 'web_research') result = await webResearch(String(args.query ?? ''), Math.min(Number(args.max_results ?? 3), 3));
   else if (name === 'place_order') {
     if (!tradingEnabled) throw new Error('Trading is disabled by TRADING_ENABLED=false');
+    const orderType = Number(args.t);
+    const size = Number(args.s);
     const leverageHundredths = Number(args.lv ?? 0);
+    if (![1, 2, 3, 4].includes(orderType)) throw new Error('Invalid order type; use 1 OpenLong, 2 OpenShort, 3 CloseLong, 4 CloseShort');
+    if (!Number.isFinite(size) || size <= 0) throw new Error('Invalid order size');
     if (!Number.isFinite(leverageHundredths) || leverageHundredths <= 0) throw new Error('Invalid leverage');
     if (leverageHundredths > maxLeverage * 100) throw new Error(`Requested leverage exceeds MAX_LEVERAGE=${maxLeverage}`);
-    result = await perpl.placeOrder(args as any);
+    if (orderType === 1 && !allowLong) throw new Error('Long entries are disabled by ALLOW_LONG=false');
+    if (orderType === 2 && !allowShort) throw new Error('Short entries are disabled by ALLOW_SHORT=false');
+    if (orderType === 3 || orderType === 4) {
+      const linkedPositionId = Number(args.lp ?? 0);
+      if (!Number.isFinite(linkedPositionId) || linkedPositionId <= 0) throw new Error('Close orders require lp=exact position id');
+      const state: any = await perpl.getState();
+      const positions = Array.isArray(state?.positions) ? state.positions : [];
+      const position: any = positions.find((item: any) => Number(item?.pid) === linkedPositionId);
+      if (!position) throw new Error(`Position ${linkedPositionId} is not open or is not in current Perpl state`);
+      const expectedType = Number(position.sd) === 1 ? 3 : Number(position.sd) === 2 ? 4 : 0;
+      if (expectedType !== orderType) throw new Error(`Order type ${orderType} does not match position ${linkedPositionId}`);
+      const positionSize = Number(position.s);
+      if (!Number.isFinite(positionSize) || positionSize <= 0 || size > positionSize) throw new Error(`Close size ${size} exceeds position ${linkedPositionId} size ${positionSize}`);
+    }
+    result = await perpl.placeOrder({ ...args, mkt: Number(args.mkt), t: orderType, s: size, lv: leverageHundredths, fl: Number(args.fl) } as any);
+  } else if (name === 'manage_position') {
+    if (!tradingEnabled) throw new Error('Trading is disabled by TRADING_ENABLED=false');
+    const positionId = Number(args.position_id);
+    if (!Number.isInteger(positionId) || positionId <= 0) throw new Error('Invalid position_id');
+    const state: any = await perpl.getState();
+    const positions = Array.isArray(state?.positions) ? state.positions : [];
+    const position: any = positions.find((item: any) => Number(item?.pid) === positionId);
+    if (!position) throw new Error(`Position ${positionId} is not open or is not in current Perpl state`);
+    const side = Number(position.sd);
+    const orderType = side === 1 ? 3 : side === 2 ? 4 : 0;
+    if (!orderType) throw new Error(`Position ${positionId} has unknown side`);
+    const positionSize = Number(position.s);
+    if (!Number.isFinite(positionSize) || positionSize <= 0) throw new Error(`Position ${positionId} has invalid size`);
+    const action = String(args.action ?? 'close');
+    const requestedSize = action === 'close' ? positionSize : Number(args.size ?? 0);
+    if (!Number.isFinite(requestedSize) || requestedSize <= 0 || requestedSize > positionSize) throw new Error(`Invalid management size for position ${positionId}`);
+    const leverage = Number(position.lv ?? 0);
+    if (!Number.isFinite(leverage) || leverage <= 0) throw new Error(`Position ${positionId} has invalid leverage`);
+    result = await perpl.placeOrder({ mkt: Number(position.mkt), t: orderType, s: requestedSize, lv: leverage, fl: 0, p: 0, lp: positionId } as any);
   } else if (name === 'cancel_order') result = await perpl.cancelOrder(Number(args.mkt), Number(args.oid));
   else throw new Error(`Unknown tool: ${name}`);
   return compactToolResult(name, result);
@@ -238,21 +277,35 @@ export async function cycle() {
     try {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(6);
-      const system = `You are an autonomous Perpl trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}.
+      const system = `You are an autonomous Perpl portfolio trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}.
 Perpl is the execution venue and the primary source of truth for account state and venue market data. Never substitute generic data when a Perpl-native tool can answer it.
 Use the user strategy as the governing instruction set.
-Gather focused evidence, form an explicit probability-weighted forecast and time horizon, identify disconfirming evidence, then choose long, short, management, or do nothing.
-Before trading, ALWAYS call get_state and use its fresh balance/available balance/orders/positions. Never reuse an old balance from memory.
+
+PORTFOLIO OPERATING RULES:
+- Think in terms of the WHOLE PORTFOLIO, not one favorite market.
+- Before every trade decision ALWAYS call get_state and inspect ALL open positions and ALL open orders.
+- Existing positions are independent objects identified by position id (pid). Evaluate each one separately: hold, reduce, fully close, or keep managing it.
+- You may manage MULTIPLE positions in the same cycle. Do not stop after handling one position if other positions also need attention.
+- You may open positions in MULTIPLE markets in the same cycle when the evidence and strategy justify them. Do not default to HYPE; compare the available Perpl markets and trade the best supported setups.
+- When reducing or closing a position, use its exact pid. manage_position is the preferred tool for precise reduction/closure.
+- For a long position, close with t=3; for a short position, close with t=4. Never use the opposite close type.
+- Do not accidentally open a new position when intending to close/reduce one. Close/reduce only against the exact existing pid.
+- Check total portfolio exposure, overlapping/correlated positions, and available balance before adding new exposure.
+- If several positions are valid, manage them one by one and re-check state as needed. Tool calls are sequential.
+- Never assume there is only one position, one order, or one market worth trading.
+
+DECISION PROCESS:
+Gather focused evidence, compare relevant markets, form an explicit probability-weighted forecast and time horizon, identify disconfirming evidence, then choose entries, position management, or do nothing.
 Use native Perpl candles and funding when relevant. Keep history windows focused.
 Confirm account exists, has current funds, is not frozen, and has API forwarding enabled before placing an order.
 Long entries are ${allowLong ? 'allowed' : 'disabled'}; short entries are ${allowShort ? 'allowed' : 'disabled'}; maximum leverage is ${maxLeverage}x; actual trading execution is ${tradingEnabled ? 'enabled' : 'disabled'}.
-Do not force a trade when evidence is weak. When evidence is sufficient and the strategy supports it, execute the best supported long or short setup rather than defaulting to do nothing.
+Do not force a trade when evidence is weak. When evidence is sufficient and the strategy supports it, execute the best supported setups, including multiple positions when justified, rather than defaulting to do nothing.
 Never claim execution success unless the order tool confirms it. Never expose credentials.
 
 USER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResult('get_trading_memory', memory))}`;
       const messages: any[] = [
         { role: 'system', content: system },
-        { role: 'user', content: 'Run one autonomous trading cycle. Refresh Perpl state, inspect relevant native Perpl data, research only what matters, decide, and execute when justified. Finish with the key forecast, current account balance, and confidence.' },
+        { role: 'user', content: 'Run one autonomous portfolio cycle. First refresh Perpl state and review every current position/order. Compare multiple available markets rather than anchoring on HYPE. Manage existing positions first when needed, then consider new entries. You may take multiple justified actions in this cycle. Finish with the key forecast, portfolio state, actions taken, and confidence.' },
       ];
       const maxSteps = Math.min(Math.max(Number(process.env.MAX_TOOL_STEPS ?? 8), 1), 8);
       let finalResult = 'No final response.';
@@ -277,7 +330,7 @@ USER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResul
       }
       status.lastResult = finalResult;
       log(finalResult);
-      await saveTradingMemory({ timestamp: new Date().toISOString(), action: toolNames.includes('place_order') ? 'trade' : 'no-trade-or-management', toolCalls: toolNames.slice(-20), summary: finalResult.slice(0, 5000) });
+      await saveTradingMemory({ timestamp: new Date().toISOString(), action: toolNames.includes('place_order') || toolNames.includes('manage_position') ? 'trade' : 'no-trade-or-management', toolCalls: toolNames.slice(-20), summary: finalResult.slice(0, 5000) });
     } catch (error) {
       status.lastError = error instanceof Error ? error.message : String(error);
       log(`Cycle failed: ${status.lastError}`);
