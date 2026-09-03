@@ -22,7 +22,7 @@ const fallbackEnabled = process.env.FALLBACK_ENABLED !== 'false';
 const fallbackProvider = (process.env.FALLBACK_PROVIDER ?? 'gemini').trim().toLowerCase();
 const fallbackApiKey = fallbackProvider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.FALLBACK_API_KEY;
 const fallbackBaseUrl = process.env.FALLBACK_BASE_URL ?? (fallbackProvider === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta/openai/' : '');
-const fallbackModelName = process.env.FALLBACK_MODEL ?? (fallbackProvider === 'gemini' ? 'gemini-2.5-flash' : '');
+const fallbackModelName = process.env.FALLBACK_MODEL ?? (fallbackProvider === 'gemini' ? 'gemini-3.7-flash' : '');
 const fallbackModel: ModelConfig | null = fallbackEnabled && fallbackApiKey && fallbackBaseUrl && fallbackModelName
   ? { provider: fallbackProvider, apiKey: fallbackApiKey, baseUrl: fallbackBaseUrl, model: fallbackModelName }
   : null;
@@ -40,6 +40,14 @@ function isToolArgumentError(error: unknown): boolean {
   return value?.status === 400 && /tool call|tool_call|arguments|valid json|failed_generation/i.test(message);
 }
 
+function errorSummary(error: unknown): string {
+  const value = error as { status?: number; code?: string; message?: string; error?: { message?: string } };
+  const status = value?.status !== undefined ? ` status=${value.status}` : '';
+  const code = value?.code ? ` code=${value.code}` : '';
+  const message = String(value?.message ?? value?.error?.message ?? error);
+  return `${status}${code} ${message}`.trim();
+}
+
 function isTransientModelError(error: unknown): boolean {
   const value = error as { status?: number; code?: string; message?: string };
   if (value?.status === 408 || value?.status === 413 || value?.status === 429 || (typeof value?.status === 'number' && value.status >= 500)) return true;
@@ -53,19 +61,18 @@ function compactText(value: unknown, maxChars: number): string {
   return `${text.slice(0, Math.max(0, maxChars - 120))}\n...[truncated ${text.length - maxChars} chars]...`;
 }
 
-function compactMessages(messages: any[]): any[] {
-  const maxChars = 26000;
+function compactMessages(messages: any[], maxChars: number): any[] {
   const first = messages.slice(0, 2).map((message) => ({
     ...message,
-    content: message.content === undefined ? message.content : compactText(message.content, 9000),
+    content: message.content === undefined ? message.content : compactText(message.content, Math.min(7000, Math.floor(maxChars * 0.42))),
   }));
   const recent = messages.slice(2);
   const kept: any[] = [];
   let chars = first.reduce((total, message) => total + JSON.stringify(message).length, 0);
+  const perMessage = Math.min(3200, Math.max(1200, Math.floor(maxChars * 0.22)));
   for (let i = recent.length - 1; i >= 0; i--) {
-    const message = recent[i];
-    const copy: any = { ...message };
-    if (copy.content !== undefined) copy.content = compactText(copy.content, 4500);
+    const copy: any = { ...recent[i] };
+    if (copy.content !== undefined) copy.content = compactText(copy.content, perMessage);
     const serializedLength = JSON.stringify(copy).length;
     if (chars + serializedLength > maxChars) break;
     kept.unshift(copy);
@@ -76,17 +83,21 @@ function compactMessages(messages: any[]): any[] {
 
 async function callProvider(config: ModelConfig, client: OpenAI, messages: any[], tools: any[], retryToolGeneration = false) {
   const groq = config.provider === 'groq';
-  const boundedMessages = compactMessages(messages);
+  const messageBudget = groq ? 14000 : 26000;
+  const boundedMessages = compactMessages(messages, messageBudget);
   const request: any = {
     model: config.model,
     messages: boundedMessages,
     tools,
     tool_choice: 'auto',
     parallel_tool_calls: false,
-    temperature: retryToolGeneration ? 0 : 0.2,
-    max_completion_tokens: 2048,
+    max_completion_tokens: groq ? 1024 : 2048,
   };
-  if (groq) request.reasoning_effort = retryToolGeneration ? 'low' : 'medium';
+  if (groq) {
+    request.temperature = retryToolGeneration ? 0 : 0.2;
+    request.reasoning_effort = retryToolGeneration ? 'low' : 'medium';
+  }
+  console.log(`[model] request provider=${config.provider} model=${config.model} messages_chars=${JSON.stringify(boundedMessages).length} tools_chars=${JSON.stringify(tools).length} max_completion_tokens=${request.max_completion_tokens}`);
   return client.chat.completions.create(request);
 }
 
@@ -94,18 +105,25 @@ async function createCompletion(messages: any[], tools: any[]) {
   try {
     return await callProvider(primaryModel, primaryClient, messages, tools);
   } catch (error) {
+    console.warn(`[model] primary ${primaryModel.provider}/${primaryModel.model} failed: ${errorSummary(error)}`);
     if (primaryModel.provider === 'groq' && isToolArgumentError(error)) {
       console.warn('[model] Groq rejected a generated tool call; retrying with deterministic tool-call settings.');
       try {
         return await callProvider(primaryModel, primaryClient, messages, tools, true);
       } catch (retryError) {
+        console.warn(`[model] Groq deterministic retry failed: ${errorSummary(retryError)}`);
         error = retryError;
       }
     }
     if (!fallbackModel || !fallbackClient) throw error;
     if (!isTransientModelError(error) && !isToolArgumentError(error)) throw error;
     console.warn(`[model] ${primaryModel.provider}/${primaryModel.model} unavailable; falling back to ${fallbackModel.provider}/${fallbackModel.model}`);
-    return await callProvider(fallbackModel, fallbackClient, messages, tools);
+    try {
+      return await callProvider(fallbackModel, fallbackClient, messages, tools);
+    } catch (fallbackError) {
+      console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} failed: ${errorSummary(fallbackError)}`);
+      throw fallbackError;
+    }
   }
 }
 
@@ -277,8 +295,7 @@ export async function cycle() {
     try {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(6);
-      const system = `You are an autonomous Perpl portfolio trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}.
-Perpl is the execution venue and the primary source of truth for account state and venue market data. Never substitute generic data when a Perpl-native tool can answer it.
+      const system = `You are an autonomous Perpl portfolio trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}. Perpl is the execution venue and the primary source of truth for account state and venue market data. Never substitute generic data when a Perpl-native tool can answer it.
 Use the user strategy as the governing instruction set.
 
 PORTFOLIO OPERATING RULES:
