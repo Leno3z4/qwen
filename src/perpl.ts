@@ -36,6 +36,15 @@ function object(value: unknown): Json | null {
 function array(value: unknown): Json[] { return Array.isArray(value) ? value.filter((item): item is Json => !!object(item)) : []; }
 function numeric(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
 function decimalString(value: unknown): string | null { return typeof value === 'string' ? value : null; }
+function ordersFrom(value: unknown): Json[] {
+  if (Array.isArray(value)) return array(value);
+  const source = object(value);
+  if (!source) return [];
+  for (const key of ['orders', 'data', 'items']) {
+    if (Array.isArray(source[key])) return array(source[key]);
+  }
+  return [];
+}
 
 export class PerplClient {
   private ws?: WebSocket;
@@ -171,6 +180,7 @@ export class PerplClient {
       locked_balance: account?.lb ?? null,
       available_balance: this.availableBalance(account),
       orders: this.state.orders,
+      order_count: this.state.orders.length,
       positions: this.state.positions,
       head_block: this.state.headBlock,
       stale: !this.state.updatedAt || Date.now() - this.state.updatedAt > 5000,
@@ -201,7 +211,11 @@ export class PerplClient {
     this.ws = ws;
     await new Promise<void>((resolve, reject) => {
       let settled = false;
-      const timeout = setTimeout(() => { if (!settled) { settled = true; reject(new Error('Perpl trading WebSocket authentication timeout')); } }, 6000);
+      let gotWalletSnapshot = false;
+      let gotOrdersSnapshot = false;
+      let gotPositionsSnapshot = false;
+      const finish = (fn: () => void) => { if (settled) return; settled = true; clearTimeout(timeout); fn(); };
+      const timeout = setTimeout(() => finish(() => reject(new Error('Perpl trading WebSocket snapshots timeout'))), 6000);
       ws.once('open', async () => {
         try {
           const timestamp = Date.now().toString();
@@ -210,17 +224,21 @@ export class PerplClient {
           const signature = await ed.signAsync(Buffer.from(canonical), privateKey);
           ws.send(JSON.stringify({ mt: 29, chain_id: CHAIN_ID, api_key: apiKey, timestamp, nonce, signature: Buffer.from(signature).toString('base64url') }));
         } catch (error) {
-          if (!settled) { settled = true; clearTimeout(timeout); reject(error); }
+          finish(() => reject(error instanceof Error ? error : new Error(String(error))));
         }
       });
       ws.on('message', (raw) => {
         let message: Json;
         try { message = JSON.parse(raw.toString()) as Json; } catch { return; }
         this.consume(message);
-        if (Number(message.mt) === 19 && !settled) { settled = true; clearTimeout(timeout); resolve(); }
+        const mt = Number(message.mt);
+        if (mt === 19) gotWalletSnapshot = true;
+        else if (mt === 23) gotOrdersSnapshot = true;
+        else if (mt === 26) gotPositionsSnapshot = true;
+        if (gotWalletSnapshot && gotOrdersSnapshot && gotPositionsSnapshot) finish(resolve);
       });
-      ws.once('error', (error) => { if (!settled) { settled = true; clearTimeout(timeout); reject(error); } });
-      ws.once('close', () => { if (this.ws === ws) this.ws = undefined; if (!settled) { settled = true; clearTimeout(timeout); reject(new Error('Perpl trading WebSocket closed before authentication')); } });
+      ws.once('error', (error) => finish(() => reject(error)));
+      ws.once('close', () => { if (this.ws === ws) this.ws = undefined; if (!settled) finish(() => reject(new Error('Perpl trading WebSocket closed before snapshots completed'))); });
     });
   }
 
@@ -245,10 +263,12 @@ export class PerplClient {
       }
       const lfr = numeric(account?.lfr);
       if (lfr !== null) this.requestId = Math.max(this.requestId, lfr);
-    } else if (Number(message.mt) === 23) this.state.orders = array(message.d);
-    else if (Number(message.mt) === 24) { const item = object(message.d); if (item) this.applyUpdate(this.state.orders, item); else { for (const item of array(message.d)) this.applyUpdate(this.state.orders, item); } }
+    } else if (Number(message.mt) === 23) this.state.orders = ordersFrom(message.d);
+    else if (Number(message.mt) === 24) {
+      for (const item of ordersFrom(message.d)) this.applyUpdate(this.state.orders, item);
+    }
     else if (Number(message.mt) === 26) this.state.positions = array(message.d);
-    else if (Number(message.mt) === 27) { const item = object(message.d); if (item) this.applyUpdate(this.state.positions, item); else { for (const item of array(message.d)) this.applyUpdate(this.state.positions, item); } }
+    else if (Number(message.mt) === 27) { const items = array(message.d); for (const item of items) this.applyUpdate(this.state.positions, item); }
     else if (Number(message.mt) === 100) {
       const sequence = numeric(message.sn);
       const head = numeric(message.h);
@@ -271,7 +291,7 @@ export class PerplClient {
   }
 
   private orderFromMessage(message: Json, rq: number): Json | null {
-    const matches = [message, ...array(message.d)].filter((item) => Number(item.rq) === rq);
+    const matches = [message, ...ordersFrom(message.d)].filter((item) => Number(item.rq) === rq);
     return matches.length ? matches[matches.length - 1] : null;
   }
 
