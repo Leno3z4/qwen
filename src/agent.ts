@@ -33,6 +33,7 @@ function clientFor(config: ModelConfig) {
 
 const primaryClient = clientFor(primaryModel);
 const fallbackClient = fallbackModel ? clientFor(fallbackModel) : null;
+let primaryCooldownUntil = 0;
 
 function isToolArgumentError(error: unknown): boolean {
   const value = error as { status?: number; message?: string; error?: { message?: string; failed_generation?: unknown } };
@@ -42,7 +43,7 @@ function isToolArgumentError(error: unknown): boolean {
 
 function errorSummary(error: unknown): string {
   const value = error as { status?: number; code?: string; message?: string; error?: { message?: string } };
-  const status = value?.status !== undefined ? ` status=${value.status}` : '';
+  const status = value?.status !== undefined ? `status=${value.status}` : '';
   const code = value?.code ? ` code=${value.code}` : '';
   const message = String(value?.message ?? value?.error?.message ?? error);
   return `${status}${code} ${message}`.trim();
@@ -52,7 +53,21 @@ function isTransientModelError(error: unknown): boolean {
   const value = error as { status?: number; code?: string; message?: string };
   if (value?.status === 408 || value?.status === 413 || value?.status === 429 || (typeof value?.status === 'number' && value.status >= 500)) return true;
   if (['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(value?.code ?? ''))) return true;
-  return /timeout|temporarily unavailable|connection reset|request too large|context length|too many tokens|fetch failed/i.test(String(value?.message ?? error));
+  return /timeout|temporarily unavailable|connection reset|request too large|context length|too many tokens|fetch failed|service unavailable/i.test(String(value?.message ?? error));
+}
+
+function parseRetryDelayMs(error: unknown): number | null {
+  const text = errorSummary(error);
+  const match = text.match(/try again in\s+(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?/i);
+  if (!match) return null;
+  const minutes = Number(match[1] ?? 0);
+  const seconds = Number(match[2] ?? 0);
+  const total = (minutes * 60 + seconds) * 1000;
+  return Number.isFinite(total) && total > 0 ? total : null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function compactText(value: unknown, maxChars: number): string {
@@ -101,7 +116,29 @@ async function callProvider(config: ModelConfig, client: OpenAI, messages: any[]
   return client.chat.completions.create(request);
 }
 
+async function callFallback(messages: any[], tools: any[]) {
+  if (!fallbackModel || !fallbackClient) throw new Error('Fallback model is not configured');
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await callProvider(fallbackModel, fallbackClient, messages, tools);
+    } catch (error) {
+      lastError = error;
+      console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} attempt ${attempt + 1}/3 failed: ${errorSummary(error)}`);
+      if (!isTransientModelError(error)) throw error;
+      const retryDelay = parseRetryDelayMs(error);
+      if (retryDelay !== null && retryDelay > 10_000) throw error;
+      if (attempt < 2) await sleep(retryDelay ?? (1500 * (attempt + 1)));
+    }
+  }
+  throw lastError;
+}
+
 async function createCompletion(messages: any[], tools: any[]) {
+  if (fallbackModel && fallbackClient && Date.now() < primaryCooldownUntil) {
+    console.warn(`[model] primary ${primaryModel.provider}/${primaryModel.model} is cooling down; using fallback without another primary request`);
+    return await callFallback(messages, tools);
+  }
   try {
     return await callProvider(primaryModel, primaryClient, messages, tools);
   } catch (error) {
@@ -117,13 +154,11 @@ async function createCompletion(messages: any[], tools: any[]) {
     }
     if (!fallbackModel || !fallbackClient) throw error;
     if (!isTransientModelError(error) && !isToolArgumentError(error)) throw error;
-    console.warn(`[model] ${primaryModel.provider}/${primaryModel.model} unavailable; falling back to ${fallbackModel.provider}/${fallbackModel.model}`);
-    try {
-      return await callProvider(fallbackModel, fallbackClient, messages, tools);
-    } catch (fallbackError) {
-      console.error(`[model] fallback ${fallbackModel.provider}/${fallbackModel.model} failed: ${errorSummary(fallbackError)}`);
-      throw fallbackError;
-    }
+    const retryDelay = parseRetryDelayMs(error);
+    const cooldown = Math.min(Math.max(retryDelay ?? 120_000, 60_000), 20 * 60_000);
+    primaryCooldownUntil = Date.now() + cooldown;
+    console.warn(`[model] ${primaryModel.provider}/${primaryModel.model} unavailable; cooling primary for ${Math.ceil(cooldown / 1000)}s and falling back to ${fallbackModel.provider}/${fallbackModel.model}`);
+    return await callFallback(messages, tools);
   }
 }
 
