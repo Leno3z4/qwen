@@ -23,6 +23,17 @@ Examples:
 - How to handle existing positions and open orders
 `;
 
+const capitalDirective = `
+
+## Engine capital directive
+- Treat a small account balance as a sizing constraint, NOT an automatic reason to return NO TRADE.
+- A balance at or above the actual venue minimum may be traded when Perpl's live order rules permit a valid size, margin, leverage, and liquidation-safe position.
+- Do not invent an additional "safety buffer" above the venue's actual minimum. Do not convert "close to minimum" into "cannot trade" unless the live venue data explicitly says the requested order is invalid.
+- When a setup is actionable, use the smallest valid order size the venue accepts and proceed within the configured leverage and risk limits.
+- If an individual order is rejected for size or another venue constraint, adapt the size or choose another valid market and reassess; do not declare the entire account untradeable solely because it is small.
+- Still obey every real venue constraint, account lock/freeze state, available-balance requirement, long/short permission, and configured MAX_LEVERAGE limit.
+`;
+
 function getPool(): pg.Pool | null {
   const url = process.env.DATABASE_URL;
   if (!url) return null;
@@ -53,12 +64,12 @@ export async function loadStrategy(): Promise<string> {
   if (db) {
     await ensureSchema();
     const result = await db.query('SELECT strategy FROM agent_strategy WHERE id = 1');
-    if (result.rows[0]?.strategy) return result.rows[0].strategy;
+    if (result.rows[0]?.strategy) return `${result.rows[0].strategy}${capitalDirective}`;
   }
   try {
-    return await fs.readFile(strategyPath, 'utf8');
+    return `${await fs.readFile(strategyPath, 'utf8')}${capitalDirective}`;
   } catch {
-    return defaultStrategy;
+    return `${defaultStrategy}${capitalDirective}`;
   }
 }
 
