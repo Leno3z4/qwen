@@ -12,17 +12,17 @@ if (!process.env.PERPL_API_KEY) throw new Error('Missing PERPL_API_KEY');
 if (!process.env.PERPL_API_PRIVATE_KEY && !process.env.PERPL_API_KEY_SECRET) throw new Error('Missing PERPL_API_PRIVATE_KEY');
 
 const primaryProvider = (process.env.MODEL_PROVIDER ?? 'groq').trim().toLowerCase();
-const primaryApiKey = primaryProvider === 'groq' ? process.env.GROQ_API_KEY : process.env.MODEL_API_KEY ?? process.env.QWEN_API_KEY;
+const primaryApiKey = primaryProvider === 'groq' ? process.env.GROQ_API_KEY : process.env.MODEL_API_KEY ?? process.env.QWEN_API_KEY ?? process.env.OPENROUTER_API_KEY;
 const primaryBaseUrl = process.env.MODEL_BASE_URL ?? (primaryProvider === 'groq' ? 'https://api.groq.com/openai/v1' : process.env.QWEN_BASE_URL ?? 'https://openrouter.ai/api/v1');
 const primaryModelName = process.env.MODEL_NAME ?? (primaryProvider === 'groq' ? 'openai/gpt-oss-120b' : process.env.QWEN_MODEL ?? 'qwen/qwen3-235b-a22b-2507:free');
-if (!primaryApiKey) throw new Error(primaryProvider === 'groq' ? 'Missing GROQ_API_KEY' : 'Missing MODEL_API_KEY/QWEN_API_KEY');
+if (!primaryApiKey) throw new Error(primaryProvider === 'groq' ? 'Missing GROQ_API_KEY' : 'Missing MODEL_API_KEY/QWEN_API_KEY/OPENROUTER_API_KEY');
 
 const primaryModel: ModelConfig = { provider: primaryProvider, apiKey: primaryApiKey, baseUrl: primaryBaseUrl, model: primaryModelName };
 const fallbackEnabled = process.env.FALLBACK_ENABLED !== 'false';
 const fallbackProvider = (process.env.FALLBACK_PROVIDER ?? 'gemini').trim().toLowerCase();
 const fallbackApiKey = fallbackProvider === 'gemini' ? process.env.GEMINI_API_KEY : process.env.FALLBACK_API_KEY;
 const fallbackBaseUrl = process.env.FALLBACK_BASE_URL ?? (fallbackProvider === 'gemini' ? 'https://generativelanguage.googleapis.com/v1beta/openai/' : '');
-const fallbackModelName = process.env.FALLBACK_MODEL ?? (fallbackProvider === 'gemini' ? 'gemini-3.7-flash' : '');
+const fallbackModelName = process.env.FALLBACK_MODEL ?? (fallbackProvider === 'gemini' ? 'gemini-2.5-flash-lite' : '');
 const fallbackModel: ModelConfig | null = fallbackEnabled && fallbackApiKey && fallbackBaseUrl && fallbackModelName
   ? { provider: fallbackProvider, apiKey: fallbackApiKey, baseUrl: fallbackBaseUrl, model: fallbackModelName }
   : null;
@@ -38,6 +38,9 @@ let fallbackCooldownUntil = 0;
 let fallbackCooldownReason = '';
 let cycleModelCalls = 0;
 let cycleFallbackCalls = 0;
+
+const configuredMaxStepsRaw = Number(process.env.MAX_TOOL_STEPS ?? 20);
+const configuredMaxSteps = Number.isFinite(configuredMaxStepsRaw) ? Math.min(Math.max(Math.floor(configuredMaxStepsRaw), 1), 300) : 20;
 
 function isToolArgumentError(error: unknown): boolean {
   const value = error as { status?: number; message?: string; error?: { message?: string; failed_generation?: unknown } };
@@ -158,7 +161,7 @@ async function callFallback(messages: any[], tools: any[]) {
 }
 
 async function createCompletion(messages: any[], tools: any[]) {
-  if (cycleModelCalls >= 5) throw new Error('Cycle model-call budget exhausted; stopping to protect provider quotas');
+  if (cycleModelCalls >= configuredMaxSteps) throw new Error('Cycle model-call budget exhausted; stopping to protect provider quotas');
   if (fallbackModel && fallbackClient && Date.now() < primaryCooldownUntil) {
     if (Date.now() < fallbackCooldownUntil) {
       throw new Error(`Primary and fallback are cooling down; stopping this cycle${fallbackCooldownReason ? ` (${fallbackCooldownReason})` : ''}`);
@@ -191,7 +194,7 @@ async function createCompletion(messages: any[], tools: any[]) {
     if (Date.now() < fallbackCooldownUntil) {
       throw new Error(`Primary ${primaryModel.provider}/${primaryModel.model} and fallback ${fallbackModel.provider}/${fallbackModel.model} are unavailable right now`);
     }
-    if (cycleModelCalls >= 5) throw new Error('No model-call budget remains for fallback; stopping this cycle');
+    if (cycleModelCalls >= configuredMaxSteps) throw new Error('No model-call budget remains for fallback; stopping this cycle');
     cycleModelCalls += 1;
     return await callFallback(messages, tools);
   }
@@ -207,37 +210,12 @@ function compactToolResult(name: string, result: unknown): unknown {
   if (name === 'get_markets' && result && typeof result === 'object') {
     const source: any = result;
     if (Array.isArray(source.markets)) {
-      return compactValue({
-        ...source,
-        markets: source.markets.slice(0, 40).map((market: any) => ({
-          id: market?.id,
-          symbol: market?.symbol ?? market?.name,
-          price: market?.price ?? market?.mark_price ?? market?.index_price,
-          index_price: market?.index_price,
-          mark_price: market?.mark_price,
-          funding: market?.funding ?? market?.funding_rate,
-          open: market?.state?.is_open ?? market?.is_open,
-          ...Object.fromEntries(Object.entries(market ?? {}).filter(([key]) => /leverage|tick|step|min|max|status|contract|order_ttl/i.test(key))),
-        })),
-      });
+      return compactValue({ ...source, markets: source.markets.slice(0, 40).map((market: any) => ({ id: market?.id, symbol: market?.symbol ?? market?.name, price: market?.price ?? market?.mark_price ?? market?.index_price, index_price: market?.index_price, mark_price: market?.mark_price, funding: market?.funding ?? market?.funding_rate, open: market?.state?.is_open ?? market?.is_open, ...Object.fromEntries(Object.entries(market ?? {}).filter(([key]) => /leverage|tick|step|min|max|status|contract|order_ttl/i.test(key))) })) });
     }
   }
   if (name === 'get_state' && result && typeof result === 'object') {
     const source: any = result;
-    return compactValue({
-      ...source,
-      account: source.account ? {
-        id: source.account.id,
-        b: source.account.b,
-        lb: source.account.lb,
-        fr: source.account.fr,
-        fw: source.account.fw,
-        lfr: source.account.lfr,
-      } : null,
-      accounts: Array.isArray(source.accounts) ? source.accounts.slice(0, 8) : source.accounts,
-      orders: Array.isArray(source.orders) ? source.orders.slice(-30) : source.orders,
-      positions: Array.isArray(source.positions) ? source.positions.slice(-30) : source.positions,
-    });
+    return compactValue({ ...source, account: source.account ? { id: source.account.id, b: source.account.b, lb: source.account.lb, fr: source.account.fr, fw: source.account.fw, lfr: source.account.lfr } : null, accounts: Array.isArray(source.accounts) ? source.accounts.slice(0, 8) : source.accounts, orders: Array.isArray(source.orders) ? source.orders.slice(-30) : source.orders, positions: Array.isArray(source.positions) ? source.positions.slice(-30) : source.positions });
   }
   if (name === 'get_market_candles' && result && typeof result === 'object') {
     const source: any = result;
@@ -251,21 +229,10 @@ function compactToolResult(name: string, result: unknown): unknown {
   }
   if (name === 'web_research' && result && typeof result === 'object') {
     const source: any = result;
-    return compactValue({
-      query: source.query,
-      answer: typeof source.answer === 'string' ? source.answer.slice(0, 1200) : source.answer,
-      results: Array.isArray(source.results) ? source.results.slice(0, 3).map((item: any) => ({ title: item?.title, url: item?.url, published_date: item?.published_date, content: String(item?.content ?? '').slice(0, 1000) })) : [],
-    }, 6000);
+    return compactValue({ query: source.query, answer: typeof source.answer === 'string' ? source.answer.slice(0, 1200) : source.answer, results: Array.isArray(source.results) ? source.results.slice(0, 3).map((item: any) => ({ title: item?.title, url: item?.url, published_date: item?.published_date, content: String(item?.content ?? '').slice(0, 1000) })) : [] }, 6000);
   }
   if (name === 'get_trading_memory' && Array.isArray(result)) {
-    return result.slice(-6).map((entry: any) => ({
-      timestamp: entry.timestamp,
-      action: entry.action,
-      toolCalls: Array.isArray(entry.toolCalls) ? entry.toolCalls.slice(-8) : [],
-      summary: String(entry.summary ?? '').slice(0, 1000),
-      forecast: entry.forecast ? String(entry.forecast).slice(0, 700) : undefined,
-      outcome: entry.outcome ? String(entry.outcome).slice(0, 700) : undefined,
-    }));
+    return result.slice(-6).map((entry: any) => ({ timestamp: entry.timestamp, action: entry.action, toolCalls: Array.isArray(entry.toolCalls) ? entry.toolCalls.slice(-8) : [], summary: String(entry.summary ?? '').slice(0, 1000), forecast: entry.forecast ? String(entry.forecast).slice(0, 700) : undefined, outcome: entry.outcome ? String(entry.outcome).slice(0, 700) : undefined }));
   }
   return compactValue(result);
 }
@@ -278,7 +245,7 @@ const tools = [
   { type: 'function' as const, function: { name: 'get_trading_memory', description: 'Read recent agent journal entries. Use it for lessons, not stale account state.', parameters: { type: 'object', properties: { limit: { type: 'integer', minimum: 1, maximum: 20 } }, additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'web_research', description: 'Search recent web/news evidence relevant to a trading hypothesis.', parameters: { type: 'object', properties: { query: { type: 'string' }, max_results: { type: 'integer', minimum: 1, maximum: 6 } }, required: ['query'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'place_order', description: 'Place a Perpl order. t=1 OpenLong, t=2 OpenShort, t=3 CloseLong, t=4 CloseShort. For close orders, set lp to the exact position id and s to the amount to close. Multiple orders can be placed in one cycle.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, t: { type: 'integer', enum: [1, 2, 3, 4] }, s: { type: 'number', minimum: 0 }, lv: { type: 'number', minimum: 0 }, fl: { type: 'integer', minimum: 0 }, p: { type: 'number' }, a: { type: 'string' }, ms: { type: 'integer' }, tif: { type: 'integer' }, tp: { type: 'number' }, tpc: { type: 'number' }, tr: { type: 'number' }, lp: { type: 'integer', minimum: 1 }, bf: { type: 'number' } }, required: ['mkt', 't', 's', 'lv', 'fl'], additionalProperties: false } } },
-  { type: 'function' as const, function: { name: 'manage_position', description: 'Reduce or fully close ONE existing Perpl position by exact position id. Use this for precise reduction/closure. Repeat for multiple positions in the same cycle when justified.', parameters: { type: 'object', properties: { position_id: { type: 'integer', minimum: 1 }, action: { type: 'string', enum: ['reduce', 'close'] }, size: { type: 'number', minimum: 0 } }, required: ['position_id', 'action'], additionalProperties: false } } },
+  { type: 'function' as const, function: { name: 'manage_position', description: 'Reduce or fully close ONE existing Perpl position by exact position id. Use this for precise per-position management. Repeat for multiple positions in the same cycle when justified.', parameters: { type: 'object', properties: { position_id: { type: 'integer', minimum: 1 }, action: { type: 'string', enum: ['reduce', 'close'] }, size: { type: 'number', minimum: 0 } }, required: ['position_id', 'action'], additionalProperties: false } } },
   { type: 'function' as const, function: { name: 'cancel_order', description: 'Cancel an existing Perpl order.', parameters: { type: 'object', properties: { mkt: { type: 'integer', minimum: 1 }, oid: { type: 'integer', minimum: 1 } }, required: ['mkt', 'oid'], additionalProperties: false } } },
 ];
 
@@ -367,39 +334,15 @@ export async function cycle() {
     try {
       const strategy = await loadStrategy();
       const memory = await loadTradingMemory(6);
-      const system = `You are an autonomous Perpl portfolio trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}. Perpl is the execution venue and the primary source of truth for account state and venue market data. Never substitute generic data when a Perpl-native tool can answer it.
-Use the user strategy as the governing instruction set.
-
-PORTFOLIO OPERATING RULES:
-- Think in terms of the WHOLE PORTFOLIO, not one favorite market.
-- Before every trade decision ALWAYS call get_state and inspect ALL open positions and ALL open orders.
-- Existing positions are independent objects identified by position id (pid). Evaluate each one separately: hold, reduce, fully close, or keep managing it.
-- You may manage MULTIPLE positions in the same cycle. Do not stop after handling one position if other positions also need attention.
-- You may open positions in MULTIPLE markets in the same cycle when the evidence and strategy justify them. Do not default to HYPE; compare the available Perpl markets and trade the best supported setups.
-- When reducing or closing a position, use its exact pid. manage_position is the preferred tool for precise reduction/closure.
-- For a long position, close with t=3; for a short position, close with t=4. Never use the opposite close type.
-- Do not accidentally open a new position when intending to close/reduce one. Close/reduce only against the exact existing pid.
-- Check total portfolio exposure, overlapping/correlated positions, and available balance before adding new exposure.
-- If several positions are valid, manage them one by one and re-check state as needed. Tool calls are sequential.
-- Never assume there is only one position, one order, or one market worth trading.
-
-DECISION PROCESS:
-Gather focused evidence, compare relevant markets, form an explicit probability-weighted forecast and time horizon, identify disconfirming evidence, then choose entries, position management, or do nothing.
-Use native Perpl candles and funding when relevant. Keep history windows focused.
-Confirm account exists, has current funds, is not frozen, and has API forwarding enabled before placing an order.
-Long entries are ${allowLong ? 'allowed' : 'disabled'}; short entries are ${allowShort ? 'allowed' : 'disabled'}; maximum leverage is ${maxLeverage}x; actual trading execution is ${tradingEnabled ? 'enabled' : 'disabled'}.
-Do not force a trade when evidence is weak. When evidence is sufficient and the strategy supports it, execute the best supported setups, including multiple positions when justified, rather than defaulting to do nothing.
-Never claim execution success unless the order tool confirms it. Never expose credentials.
-
-USER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResult('get_trading_memory', memory))}`;
+      const system = `You are an autonomous Perpl portfolio trading agent. Primary model=${primaryModel.provider}/${primaryModel.model}; fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'}. Perpl is the execution venue and the primary source of truth for account state and venue market data. Never substitute generic data when a Perpl-native tool can answer it.\nUse the user strategy as the governing instruction set.\n\nPORTFOLIO OPERATING RULES:\n- Think in terms of the WHOLE PORTFOLIO, not one favorite market.\n- Before every trade decision ALWAYS call get_state and inspect ALL open positions and ALL open orders.\n- Existing positions are independent objects identified by position id (pid). Evaluate each one separately: hold, reduce, fully close, or keep managing it.\n- You may manage MULTIPLE positions in the same cycle. Do not stop after handling one position if other positions also need attention.\n- You may open positions in MULTIPLE markets in the same cycle when the evidence and strategy justify them. Do not default to HYPE; compare the available Perpl markets and trade the best supported setups.\n- When reducing or closing a position, use its exact pid. manage_position is the preferred tool for precise reduction/closure.\n- For a long position, close with t=3; for a short position, close with t=4. Never use the opposite close type.\n- Do not accidentally open a new position when intending to close/reduce one. Close/reduce only against the exact existing pid.\n- Check total portfolio exposure, overlapping/correlated positions, and available balance before adding new exposure.\n- If several positions are valid, manage them one by one and re-check state as needed. Tool calls are sequential.\n- Never assume there is only one position, one order, or one market worth trading.\n\nDECISION PROCESS:\nGather focused evidence, compare relevant markets, form an explicit probability-weighted forecast and time horizon, identify disconfirming evidence, then choose entries, position management, or do nothing.\nUse native Perpl candles and funding when relevant. Keep history windows focused.\nConfirm account exists, has current funds, is not frozen, and has API forwarding enabled before placing an order.\nLong entries are ${allowLong ? 'allowed' : 'disabled'}; short entries are ${allowShort ? 'allowed' : 'disabled'}; maximum leverage is ${maxLeverage}x; actual trading execution is ${tradingEnabled ? 'enabled' : 'disabled'}.\nDo not force a trade when evidence is weak. When evidence is sufficient and the strategy supports it, execute the best supported setups, including multiple positions when justified, rather than defaulting to do nothing.\nNever claim execution success unless the order tool confirms it. Never expose credentials.\n\nUSER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResult('get_trading_memory', memory))}`;
       const messages: any[] = [
         { role: 'system', content: system },
         { role: 'user', content: 'Run one autonomous portfolio cycle. First refresh Perpl state and review every current position/order. Compare multiple available markets rather than anchoring on HYPE. Manage existing positions first when needed, then consider new entries. You may take multiple justified actions in this cycle. Finish with the key forecast, portfolio state, actions taken, and confidence.' },
       ];
-      const configuredSteps = Number(process.env.MAX_TOOL_STEPS ?? 5);
-      const maxSteps = Math.min(Math.max(Number.isFinite(configuredSteps) ? configuredSteps : 5, 1), 5);
+      const maxSteps = configuredMaxSteps;
       let finalResult = 'No final response.';
       for (let step = 0; step < maxSteps; step++) {
+        console.log(`[cycle] step=${step + 1}/${maxSteps} model_calls=${cycleModelCalls}`);
         const response = await createCompletion(messages, tools);
         const message: any = response.choices[0]?.message;
         if (!message) throw new Error('Model returned no message');
@@ -416,7 +359,10 @@ USER STRATEGY:\n${strategy}\n\nRECENT MEMORY:\n${JSON.stringify(compactToolResul
           }
           messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) });
         }
-        if (step === maxSteps - 1) throw new Error('Model exceeded MAX_TOOL_STEPS');
+        if (step === maxSteps - 1) {
+          finalResult = `Cycle reached MAX_TOOL_STEPS=${maxSteps} before the model returned a final response. Tool calls: ${toolNames.slice(-20).join(', ')}`;
+          log(finalResult);
+        }
       }
       status.lastResult = finalResult;
       log(finalResult);
@@ -438,7 +384,7 @@ async function main() {
     status.enabled = enabled;
     log(enabled ? 'Autonomous loop enabled from dashboard.' : 'Autonomous loop disabled from dashboard.');
   });
-  log(`Perpl direct execution configured. model=${primaryModel.provider}/${primaryModel.model} fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'} trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x`);
+  log(`Perpl direct execution configured. model=${primaryModel.provider}/${primaryModel.model} fallback=${fallbackModel ? `${fallbackModel.provider}/${fallbackModel.model}` : 'disabled'} trading=${tradingEnabled} long=${allowLong} short=${allowShort} maxLeverage=${maxLeverage}x maxToolSteps=${configuredMaxSteps}`);
   if (status.enabled) await cycle();
   const interval = Number(process.env.TRADING_INTERVAL_MS ?? 300_000);
   if (interval > 0) setInterval(() => { if (!status.enabled || status.running) return; cycle().catch(() => undefined); }, interval);
